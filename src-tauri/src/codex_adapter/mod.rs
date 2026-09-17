@@ -692,9 +692,30 @@ impl CodexClient {
 
         // Drop 不能无限等待，但也不能把仍然拥有子进程和管道的句柄直接丢掉。
         // 将所有权交给有名字的后台回收线程，持续终止子进程并等待读写线程退出。
-        let _ = thread::Builder::new()
+        let resources = Arc::new(Mutex::new(Some((child, writer, stdout, stderr))));
+        let reaper_resources = Arc::clone(&resources);
+        let reaper = thread::Builder::new()
             .name("codex-app-server-reaper".into())
-            .spawn(move || reap_resources(child, writer, stdout, stderr));
+            .spawn(move || {
+                let resources = reaper_resources
+                    .lock()
+                    .expect("reaper resources mutex poisoned")
+                    .take();
+                if let Some((child, writer, stdout, stderr)) = resources {
+                    reap_resources(child, writer, stdout, stderr);
+                }
+            });
+        if let Err(error) = reaper {
+            // 极端情况下线程创建失败，不能让闭包捕获的资源随即析构；当前线程接管回收。
+            eprintln!("codex-app-server reaper thread creation failed: {error}");
+            if let Some((child, writer, stdout, stderr)) = resources
+                .lock()
+                .expect("reaper resources mutex poisoned")
+                .take()
+            {
+                reap_resources(child, writer, stdout, stderr);
+            }
+        }
     }
 
     #[cfg(test)]
