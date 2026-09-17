@@ -138,7 +138,7 @@ describe("normalizeQuotaResponse", () => {
     expect(formatWindowLabel(10_080)).toBe("Weekly");
     expect(formatWindowLabel(2_880)).toBe("2D");
     expect(formatWindowLabel(300)).toBe("5H");
-    expect(formatWindowLabel(90)).toBe("90M");
+    expect(formatWindowLabel(90)).toBe("90m");
     expect(formatResetCountdown(null, 100)).toBe("重置时间未知");
     expect(formatResetCountdown(99, 100)).toBe("0M");
     expect(formatResetCountdown(3_760, 100)).toBe("1H 1M");

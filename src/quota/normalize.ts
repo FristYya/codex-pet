@@ -85,7 +85,7 @@ export function formatWindowLabel(windowDurationMins: number | null): string {
   if (Number.isInteger(windowDurationMins) && windowDurationMins > 0 && windowDurationMins % 60 === 0) {
     return `${windowDurationMins / 60}H`;
   }
-  return `${windowDurationMins}M`;
+  return `${windowDurationMins}m`;
 }
 
 /** Returns the window with the least remaining quota, or null when none are usable. */
