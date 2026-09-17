@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, SendError, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -192,10 +192,16 @@ type ReaperResources = (
     Option<BackgroundThread>,
 );
 
-static REAPER_SENDER: OnceLock<Sender<ReaperResources>> = OnceLock::new();
+static REAPER_SENDER: OnceLock<Mutex<Option<Sender<ReaperResources>>>> = OnceLock::new();
 
-fn ensure_reaper() -> io::Result<&'static Sender<ReaperResources>> {
-    if let Some(sender) = REAPER_SENDER.get() {
+fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
+    let slot = REAPER_SENDER.get_or_init(|| Mutex::new(None));
+    if let Some(sender) = slot
+        .lock()
+        .expect("reaper sender mutex poisoned")
+        .as_ref()
+        .cloned()
+    {
         return Ok(sender);
     }
     let (sender, receiver) = mpsc::channel::<ReaperResources>();
@@ -206,8 +212,13 @@ fn ensure_reaper() -> io::Result<&'static Sender<ReaperResources>> {
                 reap_resources(child, writer, stdout, stderr);
             }
         })?;
-    let _ = REAPER_SENDER.set(sender);
-    Ok(REAPER_SENDER.get().expect("reaper sender initialized"))
+    *slot.lock().expect("reaper sender mutex poisoned") = Some(sender);
+    Ok(slot
+        .lock()
+        .expect("reaper sender mutex poisoned")
+        .as_ref()
+        .expect("reaper sender initialized")
+        .clone())
 }
 
 impl BackgroundThread {
@@ -294,6 +305,10 @@ impl CodexClient {
     pub fn connect(options: ClientOptions) -> Result<Self, AdapterError> {
         let executable = locate_codex()?;
         verify_codex(&executable, options.request_timeout)?;
+        ensure_reaper().map_err(|error| AdapterError::Io {
+            operation: "start resource reaper",
+            reason: error.to_string(),
+        })?;
         let child = spawn_app_server(&executable)?;
         Self::start_with_child(Box::new(child), options)
     }
@@ -724,13 +739,33 @@ impl CodexClient {
 
         // Drop 不能无限等待，但也不能把仍然拥有子进程和管道的句柄直接丢掉。
         // 将所有权交给有名字的后台回收线程，持续终止子进程并等待读写线程退出。
-        if let Some(sender) = REAPER_SENDER.get()
-            && sender.send((child, writer, stdout, stderr)).is_ok()
-        {
-            return;
+        let mut resources = Some((child, writer, stdout, stderr));
+        for _ in 0..2 {
+            let sender = match ensure_reaper() {
+                Ok(sender) => sender,
+                Err(error) => {
+                    eprintln!("codex-app-server reaper unavailable: {error}");
+                    break;
+                }
+            };
+            match sender.send(resources.take().expect("reaper resources present")) {
+                Ok(()) => return,
+                Err(SendError(returned)) => {
+                    resources = Some(returned);
+                    REAPER_SENDER
+                        .get()
+                        .expect("reaper sender slot initialized")
+                        .lock()
+                        .expect("reaper sender mutex poisoned")
+                        .take();
+                }
+            }
         }
-        // supervisor 只在进程级线程异常退出时才会走到这里；避免 Drop 再次无限等待。
-        eprintln!("codex-app-server reaper supervisor unavailable; resources retained");
+        // supervisor 连续重建失败时保留资源所有权，避免 Drop 再次无限等待。
+        eprintln!("codex-app-server reaper supervisor unavailable; resources leaked safely");
+        if let Some(resources) = resources {
+            std::mem::forget(resources);
+        }
     }
 
     #[cfg(test)]
