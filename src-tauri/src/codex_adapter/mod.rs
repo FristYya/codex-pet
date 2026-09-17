@@ -238,7 +238,13 @@ fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
         .as_ref()
         .expect("reaper sender initialized")
         .clone();
-    let _ = drain_reaper_backlog(&sender);
+    if !drain_reaper_backlog(&sender) {
+        slot.lock().expect("reaper sender mutex poisoned").take();
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "resource reaper exited while draining backlog",
+        ));
+    }
     Ok(sender)
 }
 
@@ -405,10 +411,18 @@ impl CodexClient {
         }) {
             Ok(handle) => handle,
             Err(error) => {
-                handoff_startup_child(child, options.shutdown_grace);
                 let _ = outbound.try_send(OutboundMessage::Shutdown);
                 let mut writer_thread = writer_thread;
-                let _ = writer_thread.join_until(Instant::now() + options.shutdown_grace);
+                let writer_done = writer_thread.join_until(Instant::now() + options.shutdown_grace);
+                handoff_startup_resources(
+                    child,
+                    if writer_done {
+                        None
+                    } else {
+                        Some(writer_thread)
+                    },
+                    None,
+                );
                 return Err(AdapterError::Io {
                     operation: "start stdout reader",
                     reason: error.to_string(),
@@ -422,13 +436,25 @@ impl CodexClient {
         }) {
             Ok(handle) => handle,
             Err(error) => {
-                handoff_startup_child(child, options.shutdown_grace);
                 let _ = outbound.try_send(OutboundMessage::Shutdown);
                 let deadline = Instant::now() + options.shutdown_grace;
                 let mut writer_thread = writer_thread;
                 let mut stdout_thread = stdout_thread;
-                let _ = writer_thread.join_until(deadline);
-                let _ = stdout_thread.join_until(deadline);
+                let writer_done = writer_thread.join_until(deadline);
+                let stdout_done = stdout_thread.join_until(deadline);
+                handoff_startup_resources(
+                    child,
+                    if writer_done {
+                        None
+                    } else {
+                        Some(writer_thread)
+                    },
+                    if stdout_done {
+                        None
+                    } else {
+                        Some(stdout_thread)
+                    },
+                );
                 return Err(AdapterError::Io {
                     operation: "start stderr reader",
                     reason: error.to_string(),
@@ -853,6 +879,23 @@ fn handoff_startup_child(mut child: Box<dyn ManagedChild>, timeout: Duration) {
             .push_back((Some(child), None, None, None));
         let _ = ensure_reaper();
     }
+}
+
+fn handoff_startup_resources(
+    mut child: Box<dyn ManagedChild>,
+    writer: Option<BackgroundThread>,
+    stdout: Option<BackgroundThread>,
+) {
+    abort_startup(child.as_mut(), Duration::from_millis(100));
+    if child.try_wait().ok().flatten().is_some() && writer.is_none() && stdout.is_none() {
+        return;
+    }
+    REAPER_BACKLOG
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .expect("reaper backlog mutex poisoned")
+        .push_back((Some(child), writer, stdout, None));
+    let _ = ensure_reaper();
 }
 
 impl Drop for CodexClient {
