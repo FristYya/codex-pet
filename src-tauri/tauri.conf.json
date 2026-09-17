@@ -13,10 +13,19 @@
     "windows": [
       {
         "title": "Codex Pet",
-        "width": 800,
-        "height": 600
+        "width": 164,
+        "height": 154,
+        "minWidth": 164,
+        "minHeight": 154,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false
       }
     ],
+    "macOSPrivateApi": true,
     "security": {
       "csp": null
     }
