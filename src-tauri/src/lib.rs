@@ -13,6 +13,12 @@ pub mod quota;
 
 struct AppState {
     coordinator: Arc<QuotaRefreshCoordinator>,
+    shutdown: Box<dyn Fn() + Send + Sync>,
+}
+
+struct ClientSession<C> {
+    client: Option<C>,
+    stopped: bool,
 }
 
 trait QuotaClient: Send + 'static {
@@ -31,16 +37,32 @@ impl QuotaClient for CodexClient {
 }
 
 impl AppState {
+    fn on_run_event(&self, event: &tauri::RunEvent) {
+        if matches!(event, tauri::RunEvent::Exit) {
+            (self.shutdown)();
+        }
+    }
+
     fn new<C: QuotaClient>(
         connect: impl Fn() -> Result<C, AdapterError> + Send + Sync + 'static,
         emit: impl Fn(&str, &QuotaSnapshot) + Send + Sync + 'static,
     ) -> Self {
-        let client = Mutex::new(None::<C>);
+        let session = Arc::new(Mutex::new(ClientSession::<C> {
+            client: None,
+            stopped: false,
+        }));
+        let emitter = Arc::new(Mutex::new(Some(emit)));
+        let read_session = Arc::clone(&session);
+        let active_emitter = Arc::clone(&emitter);
         let coordinator = Arc::new_cyclic(|coordinator| {
             let coordinator = coordinator.clone();
             QuotaRefreshCoordinator::new(
                 move || {
-                    let mut client = client.lock().expect("client mutex poisoned");
+                    let mut session = read_session.lock().expect("client mutex poisoned");
+                    if session.stopped {
+                        return Err(AdapterError::AlreadyShutdown);
+                    }
+                    let client = &mut session.client;
                     if client.is_none() {
                         let connected = connect()?;
                         if let Some(notifications) = connected.take_notification_receiver()
@@ -70,16 +92,41 @@ impl AppState {
                     }
                     result
                 },
-                emit,
+                move |event, snapshot| {
+                    if let Some(emit) = active_emitter
+                        .lock()
+                        .expect("emitter mutex poisoned")
+                        .as_ref()
+                    {
+                        emit(event, snapshot);
+                    }
+                },
             )
         });
-        Self { coordinator }
+        Self {
+            coordinator,
+            shutdown: Box::new(move || {
+                // Tauri does not drop managed state before process::exit. Release
+                // the captured AppHandle and wait for any in-flight read before
+                // synchronously dropping the client and disabling reconnection.
+                emitter.lock().expect("emitter mutex poisoned").take();
+                let mut session = session.lock().expect("client mutex poisoned");
+                session.stopped = true;
+                session.client.take();
+            }),
+        }
     }
 }
 
 #[tauri::command]
 fn read_quota(state: tauri::State<'_, AppState>) -> QuotaSnapshot {
     state.coordinator.refresh()
+}
+
+fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::RunEvent) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.on_run_event(&event);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -133,8 +180,9 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Codex Pet");
+        .build(tauri::generate_context!())
+        .expect("error while building Codex Pet")
+        .run(handle_run_event);
 }
 
 #[cfg(test)]
@@ -399,5 +447,118 @@ mod wiring_tests {
             );
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn exit_releases_the_client_and_breaks_the_managed_owner_emitter_cycle() {
+        // AppHandle strongly owns AppManager, whose managed state owns AppState.
+        // Model that exact cycle without creating a native Windows runtime.
+        let manager = Arc::new(std::sync::OnceLock::<AppState>::new());
+        let handle = Arc::clone(&manager);
+        let manager_owner = Arc::downgrade(&manager);
+        let (client, probe) = client(vec![Ok(response(25.0))]);
+        let clients = Mutex::new(Some(client));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let app_state = AppState::new(
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                clients
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or(AdapterError::AlreadyShutdown)
+            },
+            move |_, _| {
+                let _keep_manager_alive = &handle;
+            },
+        );
+        assert!(manager.set(app_state).is_ok());
+        let state = manager.get().unwrap();
+        let coordinator = Arc::downgrade(&state.coordinator);
+        assert_eq!(state.coordinator.refresh().windows[0].used_percent, 25.0);
+
+        state.on_run_event(&tauri::RunEvent::Ready);
+        assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&manager), 2);
+
+        state.on_run_event(&tauri::RunEvent::Exit);
+
+        assert_eq!(
+            probe.drops.load(Ordering::SeqCst),
+            1,
+            "the client must be dropped before the process exits"
+        );
+        assert_eq!(
+            Arc::strong_count(&manager),
+            1,
+            "the emitter must release its captured owner handle"
+        );
+        assert!(state.coordinator.refresh().stale);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "shutdown must prevent reconnects"
+        );
+        state.on_run_event(&tauri::RunEvent::Exit);
+        assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+        drop(manager);
+        assert!(manager_owner.upgrade().is_none());
+        assert!(
+            coordinator.upgrade().is_none(),
+            "the managed-state/AppHandle cycle must be broken"
+        );
+    }
+
+    #[test]
+    fn exit_waits_for_an_active_read_before_returning_after_client_drop() {
+        struct BlockingClient {
+            inner: FakeClient,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl QuotaClient for BlockingClient {
+            fn read_rate_limits(&self) -> Result<Value, AdapterError> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
+                self.inner.read_rate_limits()
+            }
+            fn take_notification_receiver(&self) -> Option<Receiver<ServerNotification>> {
+                self.inner.take_notification_receiver()
+            }
+        }
+        let (client, probe) = client(vec![Ok(response(25.0))]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let client = Mutex::new(Some(BlockingClient {
+            inner: client,
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let state = Arc::new(AppState::new(
+            move || Ok(client.lock().unwrap().take().unwrap()),
+            |_, _| {},
+        ));
+        let refresh_state = Arc::clone(&state);
+        let read = thread::spawn(move || refresh_state.coordinator.refresh());
+        entered_rx.recv_timeout(TIMEOUT).unwrap();
+        let (exit_started_tx, exit_started_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let exit_state = Arc::clone(&state);
+        let exit = thread::spawn(move || {
+            exit_started_tx.send(()).unwrap();
+            exit_state.on_run_event(&tauri::RunEvent::Exit);
+            exited_tx.send(()).unwrap();
+        });
+        exit_started_rx.recv_timeout(TIMEOUT).unwrap();
+        let early_exit = exited_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        read.join().unwrap();
+        exit.join().unwrap();
+        assert!(
+            early_exit.is_err(),
+            "exit returned while the client was still reading"
+        );
+        assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
     }
 }
