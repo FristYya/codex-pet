@@ -9,9 +9,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-
             let show = MenuItem::with_id(app, "show", "显示 Codex Pet", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "隐藏", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;

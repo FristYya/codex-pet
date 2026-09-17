@@ -1,19 +1,19 @@
 # Codex Pet
 
-A lightweight cross-platform desktop pet for monitoring Codex usage limits.
+A lightweight Windows desktop pet for monitoring Codex usage limits.
 
 Codex Pet lives in a small transparent window instead of a traditional application window. It reads quota information from the locally installed Codex CLI App Server and keeps account credentials inside Codex.
 
 ## Status
 
-Codex Pet is in active V0.1 development. The current milestone targets Windows first while keeping the application structure compatible with macOS.
+Codex Pet is in active V0.1 development and supports Windows 10 and Windows 11.
 
 ## Planned V0.1 features
 
 - Transparent, frameless desktop pet
 - Live Codex quota percentages and reset countdowns
 - Expandable quota details
-- Windows system tray and macOS menu-bar architecture
+- Windows system tray controls
 - Position persistence and multi-monitor safety
 - Local-only operation with no telemetry or backend
 
@@ -23,7 +23,7 @@ _A screenshot will be added after the first desktop build is visually verified._
 
 ## Requirements
 
-- Windows 10/11 or macOS
+- Windows 10/11
 - A locally installed Codex CLI signed in with a ChatGPT account
 - Node.js 24+, pnpm 11+, Rust stable, and the platform prerequisites for Tauri 2
 
@@ -65,13 +65,11 @@ Codex Pet is Local First.
 - Codex quota monitoring
 - Desktop pet UI
 - Windows validation
-- Basic macOS architecture
 - Tray controls
 - Position persistence
 
 ### Future
 
-- Complete macOS validation
 - Better animations and themes
 - Automatic updates
 - Optional local usage history
