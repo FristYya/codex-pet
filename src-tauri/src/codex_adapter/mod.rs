@@ -709,6 +709,9 @@ fn write_stdin(
                     });
                 let failed = result.as_ref().err().cloned();
                 let _ = completion.send(result);
+                if state.shutdown.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(error) = failed {
                     if !state.shutdown.load(Ordering::Acquire) {
                         state.fail(error);
@@ -740,6 +743,8 @@ fn abort_startup(child: &mut dyn ManagedChild, timeout: Duration) {
 
 impl Drop for CodexClient {
     fn drop(&mut self) {
+        let _ = self.shutdown();
+        // 第一次关闭可能只等到 deadline；再尝试一次，给已被 kill 的子进程和读写线程机会完成回收。
         let _ = self.shutdown();
     }
 }
@@ -1954,6 +1959,30 @@ mod tests {
             json!({"jsonrpc":"2.0","id":99,"method":"server/call","params":{}}),
         );
         assert!(matches!(server_request, Err(AdapterError::Protocol { .. })));
+    }
+
+    #[test]
+    fn writer_exits_after_shutdown_even_when_shutdown_control_is_not_queued() {
+        let state = Arc::new(protocol_test_state());
+        state.shutdown.store(true, Ordering::Release);
+        let (outbound_tx, outbound_rx) = mpsc::sync_channel(1);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_state = Arc::clone(&state);
+        let writer_thread = thread::spawn(move || {
+            write_stdin(Box::new(io::sink()), outbound_rx, writer_state);
+            let _ = done_tx.send(());
+        });
+
+        outbound_tx
+            .send(OutboundMessage::Write {
+                bytes: b"{}\n".to_vec(),
+                completion: completion_tx,
+            })
+            .unwrap();
+        assert!(completion_rx.recv_timeout(TEST_TIMEOUT).unwrap().is_ok());
+        assert!(done_rx.recv_timeout(TEST_TIMEOUT).is_ok());
+        writer_thread.join().unwrap();
     }
 
     #[test]
