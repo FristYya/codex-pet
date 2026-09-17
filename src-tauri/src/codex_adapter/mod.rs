@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     ffi::OsStr,
     fmt,
@@ -193,7 +193,21 @@ type ReaperResources = (
 );
 
 static REAPER_SENDER: OnceLock<Mutex<Option<Sender<ReaperResources>>>> = OnceLock::new();
-static REAPER_BACKLOG: OnceLock<Mutex<Vec<ReaperResources>>> = OnceLock::new();
+static REAPER_BACKLOG: OnceLock<Mutex<VecDeque<ReaperResources>>> = OnceLock::new();
+
+fn drain_reaper_backlog(sender: &Sender<ReaperResources>) {
+    let backlog = REAPER_BACKLOG.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut backlog = backlog.lock().expect("reaper backlog mutex poisoned");
+    while let Some(resources) = backlog.pop_front() {
+        match sender.send(resources) {
+            Ok(()) => {}
+            Err(error) => {
+                backlog.push_front(error.0);
+                break;
+            }
+        }
+    }
+}
 
 fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
     let slot = REAPER_SENDER.get_or_init(|| Mutex::new(None));
@@ -203,6 +217,7 @@ fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
         .as_ref()
         .cloned()
     {
+        drain_reaper_backlog(&sender);
         return Ok(sender);
     }
     let (sender, receiver) = mpsc::channel::<ReaperResources>();
@@ -220,17 +235,7 @@ fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
         .as_ref()
         .expect("reaper sender initialized")
         .clone();
-    let backlog = REAPER_BACKLOG.get_or_init(|| Mutex::new(Vec::new()));
-    let pending = std::mem::take(&mut *backlog.lock().expect("reaper backlog mutex poisoned"));
-    for resources in pending {
-        if let Err(error) = sender.send(resources) {
-            backlog
-                .lock()
-                .expect("reaper backlog mutex poisoned")
-                .push(error.0);
-            break;
-        }
-    }
+    drain_reaper_backlog(&sender);
     Ok(sender)
 }
 
@@ -778,10 +783,10 @@ impl CodexClient {
         eprintln!("codex-app-server reaper supervisor unavailable; resources queued for retry");
         if let Some(resources) = resources {
             REAPER_BACKLOG
-                .get_or_init(|| Mutex::new(Vec::new()))
+                .get_or_init(|| Mutex::new(VecDeque::new()))
                 .lock()
                 .expect("reaper backlog mutex poisoned")
-                .push(resources);
+                .push_back(resources);
         }
     }
 
