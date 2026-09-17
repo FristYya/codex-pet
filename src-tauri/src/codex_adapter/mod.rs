@@ -198,12 +198,14 @@ impl BackgroundThread {
         })
     }
 
-    fn join_until(mut self, deadline: Instant) {
+    fn join_until(&mut self, deadline: Instant) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if self.finished.recv_timeout(remaining).is_ok()
-            && let Some(handle) = self.handle.take()
-        {
-            let _ = handle.join();
+        match self.finished.recv_timeout(remaining) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => self
+                .handle
+                .take()
+                .is_none_or(|handle| handle.join().is_ok()),
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
         }
     }
 }
@@ -258,6 +260,7 @@ pub struct CodexClient {
     stdout_thread: Mutex<Option<BackgroundThread>>,
     stderr_thread: Mutex<Option<BackgroundThread>>,
     notification_receiver: Mutex<Option<Receiver<ServerNotification>>>,
+    shutdown_lock: Mutex<()>,
     next_id: AtomicU64,
     options: ClientOptions,
 }
@@ -336,7 +339,8 @@ impl CodexClient {
             Err(error) => {
                 abort_startup(child.as_mut(), options.shutdown_grace);
                 let _ = outbound.try_send(OutboundMessage::Shutdown);
-                writer_thread.join_until(Instant::now() + options.shutdown_grace);
+                let mut writer_thread = writer_thread;
+                let _ = writer_thread.join_until(Instant::now() + options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "start stdout reader",
                     reason: error.to_string(),
@@ -353,8 +357,10 @@ impl CodexClient {
                 abort_startup(child.as_mut(), options.shutdown_grace);
                 let _ = outbound.try_send(OutboundMessage::Shutdown);
                 let deadline = Instant::now() + options.shutdown_grace;
-                writer_thread.join_until(deadline);
-                stdout_thread.join_until(deadline);
+                let mut writer_thread = writer_thread;
+                let mut stdout_thread = stdout_thread;
+                let _ = writer_thread.join_until(deadline);
+                let _ = stdout_thread.join_until(deadline);
                 return Err(AdapterError::Io {
                     operation: "start stderr reader",
                     reason: error.to_string(),
@@ -370,6 +376,7 @@ impl CodexClient {
             stdout_thread: Mutex::new(Some(stdout_thread)),
             stderr_thread: Mutex::new(Some(stderr_thread)),
             notification_receiver: Mutex::new(Some(notification_receiver)),
+            shutdown_lock: Mutex::new(()),
             next_id: AtomicU64::new(1),
             options,
         };
@@ -479,6 +486,9 @@ impl CodexClient {
             if self.state.shutdown.load(Ordering::Acquire) {
                 return Err(AdapterError::AlreadyShutdown);
             }
+            if let Some(error) = self.state.fatal_error() {
+                return Err(error);
+            }
             match self.outbound.try_send(outbound) {
                 Ok(()) => break,
                 Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
@@ -503,6 +513,9 @@ impl CodexClient {
             if self.state.shutdown.load(Ordering::Acquire) {
                 return Err(AdapterError::AlreadyShutdown);
             }
+            if let Some(error) = self.state.fatal_error() {
+                return Err(error);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(AdapterError::Timeout {
@@ -523,25 +536,25 @@ impl CodexClient {
     }
 
     pub fn shutdown(&self) -> Result<(), AdapterError> {
-        if self.state.shutdown.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let _shutdown_guard = self.shutdown_lock.lock().expect("shutdown mutex poisoned");
+        let first_shutdown = !self.state.shutdown.swap(true, Ordering::AcqRel);
+        if first_shutdown {
+            self.state.fail(AdapterError::AlreadyShutdown);
+            let _ = self.outbound.try_send(OutboundMessage::Shutdown);
+            self.state
+                .notification_sender
+                .lock()
+                .expect("notification sender mutex poisoned")
+                .take();
         }
-
-        self.state.fail(AdapterError::AlreadyShutdown);
-        let _ = self.outbound.try_send(OutboundMessage::Shutdown);
-        self.state
-            .notification_sender
-            .lock()
-            .expect("notification sender mutex poisoned")
-            .take();
 
         let started = Instant::now();
         let deadline = started + self.options.shutdown_grace;
         let graceful_deadline = started + self.options.shutdown_grace / 2;
         let mut first_error = None;
         let mut child = self.child.lock().expect("child mutex poisoned").take();
+        let mut exited = child.is_none();
         if let Some(child_ref) = child.as_mut() {
-            let mut exited = false;
             loop {
                 match child_ref.try_wait() {
                     Ok(Some(_)) => {
@@ -596,32 +609,57 @@ impl CodexClient {
                 });
             }
         }
+        if child.is_some() && !exited {
+            first_error.get_or_insert_with(|| AdapterError::Io {
+                operation: "reap child",
+                reason: "child did not exit before the shutdown deadline".into(),
+            });
+            *self.child.lock().expect("child mutex poisoned") = child.take();
+        }
         drop(child);
 
-        if let Some(handle) = self
+        let mut writer_slot = self
             .writer_thread
             .lock()
-            .expect("writer thread mutex poisoned")
-            .take()
+            .expect("writer thread mutex poisoned");
+        if let Some(mut handle) = writer_slot.take()
+            && !handle.join_until(deadline)
         {
-            handle.join_until(deadline);
+            *writer_slot = Some(handle);
+            first_error.get_or_insert_with(|| AdapterError::Io {
+                operation: "join stdin writer",
+                reason: "stdin writer did not exit before the shutdown deadline".into(),
+            });
         }
+        drop(writer_slot);
 
-        if let Some(handle) = self
+        let mut stdout_slot = self
             .stdout_thread
             .lock()
-            .expect("stdout thread mutex poisoned")
-            .take()
+            .expect("stdout thread mutex poisoned");
+        if let Some(mut handle) = stdout_slot.take()
+            && !handle.join_until(deadline)
         {
-            handle.join_until(deadline);
+            *stdout_slot = Some(handle);
+            first_error.get_or_insert_with(|| AdapterError::Io {
+                operation: "join stdout reader",
+                reason: "stdout reader did not exit before the shutdown deadline".into(),
+            });
         }
-        if let Some(handle) = self
+        drop(stdout_slot);
+
+        let mut stderr_slot = self
             .stderr_thread
             .lock()
-            .expect("stderr thread mutex poisoned")
-            .take()
+            .expect("stderr thread mutex poisoned");
+        if let Some(mut handle) = stderr_slot.take()
+            && !handle.join_until(deadline)
         {
-            handle.join_until(deadline);
+            *stderr_slot = Some(handle);
+            first_error.get_or_insert_with(|| AdapterError::Io {
+                operation: "join stderr reader",
+                reason: "stderr reader did not exit before the shutdown deadline".into(),
+            });
         }
 
         match first_error {
@@ -893,7 +931,6 @@ struct VerificationExit {
 trait VerificationChild {
     fn try_wait(&mut self) -> io::Result<Option<VerificationExit>>;
     fn kill(&mut self) -> io::Result<()>;
-    fn wait(&mut self) -> io::Result<VerificationExit>;
 }
 
 struct SystemVerificationChild {
@@ -910,14 +947,6 @@ impl VerificationChild for SystemVerificationChild {
 
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
-    }
-
-    fn wait(&mut self) -> io::Result<VerificationExit> {
-        let status = self.child.wait()?;
-        Ok(VerificationExit {
-            success: status.success(),
-            code: status.code(),
-        })
     }
 }
 
@@ -949,21 +978,28 @@ fn verify_spawned_codex(
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                if child.kill().is_ok() {
-                    let _ = child.wait();
-                }
+                terminate_verification_child(child.as_mut(), deadline);
                 return Err(AdapterError::VersionCheckFailed {
                     reason: "process did not exit before the verification timeout".into(),
                 });
             }
             Err(error) => {
-                if child.kill().is_ok() {
-                    let _ = child.wait();
-                }
+                terminate_verification_child(child.as_mut(), deadline);
                 return Err(AdapterError::VersionCheckFailed {
                     reason: error.to_string(),
                 });
             }
+        }
+    }
+}
+
+fn terminate_verification_child(child: &mut dyn VerificationChild, deadline: Instant) {
+    let _ = child.kill();
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(_) => return,
         }
     }
 }
@@ -1372,6 +1408,33 @@ mod tests {
             stdout: Some(stdout_tx),
             stderr: None,
             state: server_state,
+        };
+        (Box::new(child), server, control)
+    }
+
+    fn stuck_reader_process() -> (Box<dyn ManagedChild>, FakeServer, Arc<HostileShutdownState>) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let control = Arc::new(HostileShutdownState::default());
+        let state = Arc::new(FakeProcessState::default());
+        let child = FakeChild {
+            stdin: Some(Box::new(LineWriter {
+                tx: request_tx,
+                buffer: Vec::new(),
+            })),
+            stdout: Some(Box::new(ReleaseGatedReader {
+                rx: stdout_rx,
+                pending: VecDeque::new(),
+                control: Arc::clone(&control),
+            })),
+            stderr: Some(Box::new(io::empty())),
+            state: Arc::clone(&state),
+        };
+        let server = FakeServer {
+            requests: request_rx,
+            stdout: Some(stdout_tx),
+            stderr: None,
+            state,
         };
         (Box::new(child), server, control)
     }
@@ -1813,7 +1876,6 @@ mod tests {
     #[derive(Default)]
     struct VerificationProcessState {
         killed: AtomicBool,
-        waited: AtomicBool,
         dropped: AtomicBool,
     }
 
@@ -1836,14 +1898,6 @@ mod tests {
             self.state.killed.store(true, Ordering::SeqCst);
             Ok(())
         }
-
-        fn wait(&mut self) -> io::Result<VerificationExit> {
-            self.state.waited.store(true, Ordering::SeqCst);
-            Ok(VerificationExit {
-                success: false,
-                code: Some(1),
-            })
-        }
     }
 
     #[test]
@@ -1857,7 +1911,6 @@ mod tests {
 
         assert!(matches!(error, AdapterError::VersionCheckFailed { .. }));
         assert!(state.killed.load(Ordering::SeqCst));
-        assert!(state.waited.load(Ordering::SeqCst));
         assert!(state.dropped.load(Ordering::SeqCst));
     }
 
@@ -1901,5 +1954,73 @@ mod tests {
             json!({"jsonrpc":"2.0","id":99,"method":"server/call","params":{}}),
         );
         assert!(matches!(server_request, Err(AdapterError::Protocol { .. })));
+    }
+
+    #[test]
+    fn shutdown_reports_and_retains_an_unfinished_stdout_reader_for_retry() {
+        let (child, server, control) = stuck_reader_process();
+        let server_control = Arc::clone(&control);
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            while !server_control.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut test_options = options();
+        test_options.shutdown_grace = Duration::from_millis(80);
+        let client = CodexClient::start_with_child(child, test_options).unwrap();
+
+        let first = client.shutdown();
+        let retained_after_first = client.stdout_thread.lock().unwrap().is_some();
+        control.release.store(true, Ordering::SeqCst);
+        server_thread.join().unwrap();
+        let second = client.shutdown();
+
+        assert!(matches!(
+            first,
+            Err(AdapterError::Io {
+                operation: "join stdout reader",
+                ..
+            })
+        ));
+        assert!(retained_after_first);
+        assert!(second.is_ok());
+        assert!(client.stdout_thread.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn blocked_writer_returns_an_existing_fatal_error_instead_of_timeout() {
+        let (child, mut server, _state, control) = blocking_writer_process();
+        let stderr = server.stderr.take().unwrap();
+        let server_control = Arc::clone(&control);
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            while !server_control.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut test_options = options();
+        test_options.request_timeout = Duration::from_millis(500);
+        let client = Arc::new(CodexClient::start_with_child(child, test_options).unwrap());
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_client = Arc::clone(&client);
+        let request_thread = thread::spawn(move || {
+            let _ = result_tx.send(request_client.read_rate_limits());
+        });
+        while !control.entered.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        stderr.send(vec![b'x'; 128]).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_millis(150));
+        control.release.store(true, Ordering::SeqCst);
+        let _ = request_thread.join();
+        let _ = client.shutdown();
+        let _ = server_thread.join();
+
+        assert!(matches!(
+            result,
+            Ok(Err(AdapterError::StderrFlooding { limit: 32 }))
+        ));
     }
 }
