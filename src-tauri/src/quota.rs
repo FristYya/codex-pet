@@ -229,6 +229,9 @@ pub fn spawn_notification_bridge(
     notifications: Receiver<ServerNotification>,
     coordinator: Arc<QuotaRefreshCoordinator>,
 ) -> JoinHandle<()> {
+    // The coordinator's reader owns the client sending these notifications.
+    // Keeping only a weak reference lets application state release that client.
+    let coordinator = Arc::downgrade(&coordinator);
     thread::spawn(move || {
         let mut deadline: Option<Instant> = None;
         loop {
@@ -236,6 +239,9 @@ pub fn spawn_notification_bridge(
                 Some(at) => {
                     let remaining = at.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
+                        let Some(coordinator) = coordinator.upgrade() else {
+                            return;
+                        };
                         coordinator.request_notification_refresh();
                         deadline = None;
                         continue;
@@ -252,6 +258,9 @@ pub fn spawn_notification_bridge(
                 }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
+                    let Some(coordinator) = coordinator.upgrade() else {
+                        return;
+                    };
                     coordinator.request_notification_refresh();
                     deadline = None;
                 }
@@ -493,7 +502,7 @@ mod tests {
                     .unwrap();
             },
         ));
-        let bridge = spawn_notification_bridge(notifications_rx, coordinator);
+        let bridge = spawn_notification_bridge(notifications_rx, Arc::clone(&coordinator));
         for _ in 0..2 {
             notifications_tx.send(notification()).unwrap();
             thread::sleep(Duration::from_millis(120));
@@ -521,7 +530,7 @@ mod tests {
             },
             |_, _| {},
         ));
-        let bridge = spawn_notification_bridge(rx, coordinator);
+        let bridge = spawn_notification_bridge(rx, Arc::clone(&coordinator));
         tx.send(ServerNotification {
             method: "account/updated".into(),
             params: json!({}),
@@ -531,5 +540,24 @@ mod tests {
         drop(tx);
         bridge.join().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn notification_bridge_does_not_keep_its_client_owner_alive() {
+        let (tx, rx) = mpsc::channel();
+        let coordinator = Arc::new(QuotaRefreshCoordinator::new(
+            || Ok(response(25.0)),
+            |_, _| {},
+        ));
+        let owner = Arc::downgrade(&coordinator);
+        let bridge = spawn_notification_bridge(rx, Arc::clone(&coordinator));
+        drop(coordinator);
+        let kept_alive = owner.upgrade().is_some();
+        drop(tx);
+        bridge.join().unwrap();
+        assert!(
+            !kept_alive,
+            "the bridge must not retain the coordinator that owns its client"
+        );
     }
 }
