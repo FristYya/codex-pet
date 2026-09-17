@@ -193,6 +193,7 @@ type ReaperResources = (
 );
 
 static REAPER_SENDER: OnceLock<Mutex<Option<Sender<ReaperResources>>>> = OnceLock::new();
+static REAPER_BACKLOG: OnceLock<Mutex<Vec<ReaperResources>>> = OnceLock::new();
 
 fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
     let slot = REAPER_SENDER.get_or_init(|| Mutex::new(None));
@@ -213,12 +214,24 @@ fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
             }
         })?;
     *slot.lock().expect("reaper sender mutex poisoned") = Some(sender);
-    Ok(slot
+    let sender = slot
         .lock()
         .expect("reaper sender mutex poisoned")
         .as_ref()
         .expect("reaper sender initialized")
-        .clone())
+        .clone();
+    let backlog = REAPER_BACKLOG.get_or_init(|| Mutex::new(Vec::new()));
+    let pending = std::mem::take(&mut *backlog.lock().expect("reaper backlog mutex poisoned"));
+    for resources in pending {
+        if let Err(error) = sender.send(resources) {
+            backlog
+                .lock()
+                .expect("reaper backlog mutex poisoned")
+                .push(error.0);
+            break;
+        }
+    }
+    Ok(sender)
 }
 
 impl BackgroundThread {
@@ -762,9 +775,13 @@ impl CodexClient {
             }
         }
         // supervisor 连续重建失败时保留资源所有权，避免 Drop 再次无限等待。
-        eprintln!("codex-app-server reaper supervisor unavailable; resources leaked safely");
+        eprintln!("codex-app-server reaper supervisor unavailable; resources queued for retry");
         if let Some(resources) = resources {
-            std::mem::forget(resources);
+            REAPER_BACKLOG
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .expect("reaper backlog mutex poisoned")
+                .push(resources);
         }
     }
 
