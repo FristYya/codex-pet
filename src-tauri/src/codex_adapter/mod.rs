@@ -668,6 +668,35 @@ impl CodexClient {
         }
     }
 
+    fn spawn_resource_reaper(&self) {
+        let child = self.child.lock().expect("child mutex poisoned").take();
+        let writer = self
+            .writer_thread
+            .lock()
+            .expect("writer thread mutex poisoned")
+            .take();
+        let stdout = self
+            .stdout_thread
+            .lock()
+            .expect("stdout thread mutex poisoned")
+            .take();
+        let stderr = self
+            .stderr_thread
+            .lock()
+            .expect("stderr thread mutex poisoned")
+            .take();
+
+        if child.is_none() && writer.is_none() && stdout.is_none() && stderr.is_none() {
+            return;
+        }
+
+        // Drop 不能无限等待，但也不能把仍然拥有子进程和管道的句柄直接丢掉。
+        // 将所有权交给有名字的后台回收线程，持续终止子进程并等待读写线程退出。
+        let _ = thread::Builder::new()
+            .name("codex-app-server-reaper".into())
+            .spawn(move || reap_resources(child, writer, stdout, stderr));
+    }
+
     #[cfg(test)]
     fn pending_request_count(&self) -> usize {
         self.state
@@ -746,6 +775,62 @@ impl Drop for CodexClient {
         let _ = self.shutdown();
         // 第一次关闭可能只等到 deadline；再尝试一次，给已被 kill 的子进程和读写线程机会完成回收。
         let _ = self.shutdown();
+        self.spawn_resource_reaper();
+    }
+}
+
+fn reap_resources(
+    mut child: Option<Box<dyn ManagedChild>>,
+    mut writer: Option<BackgroundThread>,
+    mut stdout: Option<BackgroundThread>,
+    mut stderr: Option<BackgroundThread>,
+) {
+    loop {
+        let mut child_exited = true;
+        if let Some(child_ref) = child.as_mut() {
+            child_exited = match child_ref.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    let _ = child_ref.kill();
+                    false
+                }
+                Err(_) => {
+                    let _ = child_ref.kill();
+                    false
+                }
+            };
+            if child_exited {
+                let _ = child_ref.wait();
+                child = None;
+            }
+        }
+
+        if child_exited {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let writer_done = writer
+                .as_mut()
+                .is_none_or(|handle| handle.join_until(deadline));
+            if writer_done {
+                writer = None;
+            }
+            let stdout_done = stdout
+                .as_mut()
+                .is_none_or(|handle| handle.join_until(deadline));
+            if stdout_done {
+                stdout = None;
+            }
+            let stderr_done = stderr
+                .as_mut()
+                .is_none_or(|handle| handle.join_until(deadline));
+            if stderr_done {
+                stderr = None;
+            }
+            if writer.is_none() && stdout.is_none() && stderr.is_none() {
+                return;
+            }
+        }
+
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2015,6 +2100,26 @@ mod tests {
         assert!(retained_after_first);
         assert!(second.is_ok());
         assert!(client.stdout_thread.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_hands_unfinished_reader_to_a_bounded_reaper() {
+        let (child, server, control) = stuck_reader_process();
+        let server_control = Arc::clone(&control);
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            while !server_control.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut test_options = options();
+        test_options.shutdown_grace = Duration::from_millis(40);
+        let client = CodexClient::start_with_child(child, test_options).unwrap();
+        let started = std::time::Instant::now();
+        drop(client);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        control.release.store(true, Ordering::SeqCst);
+        server_thread.join().unwrap();
     }
 
     #[test]
