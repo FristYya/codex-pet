@@ -1,7 +1,5 @@
-use serde::Serialize;
-use serde_json::Value;
+use quota::{QuotaSnapshot, now_seconds, snapshot_from_response};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     Manager,
     menu::{Menu, MenuItem},
@@ -9,97 +7,11 @@ use tauri::{
 };
 
 pub mod codex_adapter;
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct QuotaWindow {
-    id: String,
-    name: String,
-    used_percent: f64,
-    remaining_percent: f64,
-    window_duration_mins: Option<f64>,
-    resets_at: Option<f64>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct QuotaSnapshot {
-    availability: String,
-    windows: Vec<QuotaWindow>,
-    plan_type: Option<String>,
-    fetched_at: i64,
-    stale: bool,
-    message: Option<String>,
-}
+pub mod quota;
 
 struct AppState {
     client: Mutex<Option<codex_adapter::CodexClient>>,
     last: Mutex<Option<QuotaSnapshot>>,
-}
-
-fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
-fn as_number(value: Option<&Value>) -> Option<f64> {
-    value.and_then(Value::as_f64)
-}
-
-fn snapshot_from_response(response: &Value) -> QuotaSnapshot {
-    let bucket = response
-        .get("rateLimitsByLimitId")
-        .and_then(|v| v.get("codex"))
-        .or_else(|| response.get("rateLimits"));
-    let mut windows = Vec::new();
-    for (id, key) in [("primary", "primary"), ("secondary", "secondary")] {
-        if let Some(window) = bucket.and_then(|v| v.get(key)).and_then(Value::as_object) {
-            let used = as_number(window.get("usedPercent"))
-                .unwrap_or(0.0)
-                .clamp(0.0, 100.0);
-            let duration = as_number(window.get("windowDurationMins"));
-            let name = match duration {
-                Some(10080.0) => "Weekly".to_string(),
-                Some(value) if value > 0.0 && value % 1440.0 == 0.0 => {
-                    format!("{}D", value / 1440.0)
-                }
-                Some(value) if value > 0.0 && value % 60.0 == 0.0 => format!("{}H", value / 60.0),
-                Some(value) => format!("{}m", value),
-                None => "Unknown".to_string(),
-            };
-            windows.push(QuotaWindow {
-                id: id.into(),
-                name,
-                used_percent: used,
-                remaining_percent: 100.0 - used,
-                window_duration_mins: duration,
-                resets_at: as_number(window.get("resetsAt")),
-            });
-        }
-    }
-    let allowed = response
-        .get("ordinaryUsageAllowed")
-        .or_else(|| bucket.and_then(|v| v.get("ordinaryUsageAllowed")));
-    let availability = match allowed.and_then(Value::as_bool) {
-        Some(true) => "allowed",
-        Some(false) => "blocked",
-        None => "unknown",
-    }
-    .into();
-    QuotaSnapshot {
-        availability,
-        windows,
-        plan_type: response
-            .get("planType")
-            .or_else(|| bucket.and_then(|v| v.get("planType")))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        fetched_at: now_seconds(),
-        stale: false,
-        message: None,
-    }
 }
 
 #[tauri::command]
