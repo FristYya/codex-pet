@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
@@ -185,6 +185,31 @@ struct BackgroundThread {
     finished: Receiver<()>,
 }
 
+type ReaperResources = (
+    Option<Box<dyn ManagedChild>>,
+    Option<BackgroundThread>,
+    Option<BackgroundThread>,
+    Option<BackgroundThread>,
+);
+
+static REAPER_SENDER: OnceLock<Sender<ReaperResources>> = OnceLock::new();
+
+fn ensure_reaper() -> io::Result<&'static Sender<ReaperResources>> {
+    if let Some(sender) = REAPER_SENDER.get() {
+        return Ok(sender);
+    }
+    let (sender, receiver) = mpsc::channel::<ReaperResources>();
+    thread::Builder::new()
+        .name("codex-app-server-reaper".into())
+        .spawn(move || {
+            while let Ok((child, writer, stdout, stderr)) = receiver.recv() {
+                reap_resources(child, writer, stdout, stderr);
+            }
+        })?;
+    let _ = REAPER_SENDER.set(sender);
+    Ok(REAPER_SENDER.get().expect("reaper sender initialized"))
+}
+
 impl BackgroundThread {
     fn spawn(name: &str, task: impl FnOnce() + Send + 'static) -> io::Result<Self> {
         let (finished_tx, finished) = mpsc::channel();
@@ -277,6 +302,13 @@ impl CodexClient {
         mut child: Box<dyn ManagedChild>,
         options: ClientOptions,
     ) -> Result<Self, AdapterError> {
+        if let Err(error) = ensure_reaper() {
+            abort_startup(child.as_mut(), options.shutdown_grace);
+            return Err(AdapterError::Io {
+                operation: "start resource reaper",
+                reason: error.to_string(),
+            });
+        }
         let writer = match child.take_stdin() {
             Ok(writer) => writer,
             Err(error) => {
@@ -692,30 +724,13 @@ impl CodexClient {
 
         // Drop 不能无限等待，但也不能把仍然拥有子进程和管道的句柄直接丢掉。
         // 将所有权交给有名字的后台回收线程，持续终止子进程并等待读写线程退出。
-        let resources = Arc::new(Mutex::new(Some((child, writer, stdout, stderr))));
-        let reaper_resources = Arc::clone(&resources);
-        let reaper = thread::Builder::new()
-            .name("codex-app-server-reaper".into())
-            .spawn(move || {
-                let resources = reaper_resources
-                    .lock()
-                    .expect("reaper resources mutex poisoned")
-                    .take();
-                if let Some((child, writer, stdout, stderr)) = resources {
-                    reap_resources(child, writer, stdout, stderr);
-                }
-            });
-        if let Err(error) = reaper {
-            // 极端情况下线程创建失败，不能让闭包捕获的资源随即析构；当前线程接管回收。
-            eprintln!("codex-app-server reaper thread creation failed: {error}");
-            if let Some((child, writer, stdout, stderr)) = resources
-                .lock()
-                .expect("reaper resources mutex poisoned")
-                .take()
-            {
-                reap_resources(child, writer, stdout, stderr);
-            }
+        if let Some(sender) = REAPER_SENDER.get()
+            && sender.send((child, writer, stdout, stderr)).is_ok()
+        {
+            return;
         }
+        // supervisor 只在进程级线程异常退出时才会走到这里；避免 Drop 再次无限等待。
+        eprintln!("codex-app-server reaper supervisor unavailable; resources retained");
     }
 
     #[cfg(test)]
