@@ -324,7 +324,26 @@ mod tests {
             .collect();
         barrier.wait();
         entered_rx.recv_timeout(TIMEOUT).unwrap();
-        thread::sleep(Duration::from_millis(100));
+        // Wait until all eight callers own the active flight. Its other two
+        // owners are RefreshState and the worker; no production test hook is needed.
+        let joined_deadline = Instant::now() + TIMEOUT;
+        loop {
+            let all_joined = {
+                let state = coordinator.inner.state.lock().unwrap();
+                state
+                    .active
+                    .as_ref()
+                    .is_some_and(|flight| Arc::strong_count(flight) == 10)
+            };
+            if all_joined {
+                break;
+            }
+            assert!(
+                Instant::now() < joined_deadline,
+                "all refresh callers must join the active flight"
+            );
+            thread::yield_now();
+        }
         release_tx.send(()).unwrap();
         let snapshots: Vec<_> = handles
             .into_iter()
@@ -341,13 +360,22 @@ mod tests {
         let (emitted_tx, emitted_rx) = mpsc::channel();
         let release_rx = Mutex::new(release_rx);
         let calls = Arc::new(AtomicUsize::new(0));
+        let active_reads = Arc::new(AtomicUsize::new(0));
+        let max_active_reads = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&calls);
+        let active_count = Arc::clone(&active_reads);
+        let max_active_count = Arc::clone(&max_active_reads);
         let coordinator = Arc::new(QuotaRefreshCoordinator::new(
             move || {
+                // Measure entry before the test's receiver mutex can serialize reads.
+                let active = active_count.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active_count.fetch_max(active, Ordering::SeqCst);
                 let call = count.fetch_add(1, Ordering::SeqCst) + 1;
                 entered_tx.send(call).unwrap();
                 release_rx.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
-                Ok(response(call as f64))
+                let result = Ok(response(call as f64));
+                active_count.fetch_sub(1, Ordering::SeqCst);
+                result
             },
             move |_, snapshot| {
                 emitted_tx
@@ -370,6 +398,8 @@ mod tests {
         emitted_rx.recv_timeout(TIMEOUT).unwrap();
         assert!(entered_rx.recv_timeout(Duration::from_millis(100)).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(max_active_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(active_reads.load(Ordering::SeqCst), 0);
     }
 
     #[test]
