@@ -195,7 +195,7 @@ type ReaperResources = (
 static REAPER_SENDER: OnceLock<Mutex<Option<Sender<ReaperResources>>>> = OnceLock::new();
 static REAPER_BACKLOG: OnceLock<Mutex<VecDeque<ReaperResources>>> = OnceLock::new();
 
-fn drain_reaper_backlog(sender: &Sender<ReaperResources>) {
+fn drain_reaper_backlog(sender: &Sender<ReaperResources>) -> bool {
     let backlog = REAPER_BACKLOG.get_or_init(|| Mutex::new(VecDeque::new()));
     let mut backlog = backlog.lock().expect("reaper backlog mutex poisoned");
     while let Some(resources) = backlog.pop_front() {
@@ -203,10 +203,11 @@ fn drain_reaper_backlog(sender: &Sender<ReaperResources>) {
             Ok(()) => {}
             Err(error) => {
                 backlog.push_front(error.0);
-                break;
+                return false;
             }
         }
     }
+    true
 }
 
 fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
@@ -217,8 +218,10 @@ fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
         .as_ref()
         .cloned()
     {
-        drain_reaper_backlog(&sender);
-        return Ok(sender);
+        if drain_reaper_backlog(&sender) {
+            return Ok(sender);
+        }
+        slot.lock().expect("reaper sender mutex poisoned").take();
     }
     let (sender, receiver) = mpsc::channel::<ReaperResources>();
     thread::Builder::new()
@@ -235,7 +238,7 @@ fn ensure_reaper() -> io::Result<Sender<ReaperResources>> {
         .as_ref()
         .expect("reaper sender initialized")
         .clone();
-    drain_reaper_backlog(&sender);
+    let _ = drain_reaper_backlog(&sender);
     Ok(sender)
 }
 
