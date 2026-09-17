@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -164,12 +164,48 @@ impl ManagedChild for SystemChild {
 
 type ResponseSender = Sender<Result<Value, AdapterError>>;
 
+enum OutboundMessage {
+    Write {
+        bytes: Vec<u8>,
+        completion: Sender<Result<(), AdapterError>>,
+    },
+    Shutdown,
+}
+
 struct ClientState {
     pending: Mutex<HashMap<u64, ResponseSender>>,
     fatal: Mutex<Option<AdapterError>>,
     notification_sender: Mutex<Option<Sender<ServerNotification>>>,
     stderr: Mutex<Vec<u8>>,
     shutdown: AtomicBool,
+}
+
+struct BackgroundThread {
+    handle: Option<JoinHandle<()>>,
+    finished: Receiver<()>,
+}
+
+impl BackgroundThread {
+    fn spawn(name: &str, task: impl FnOnce() + Send + 'static) -> io::Result<Self> {
+        let (finished_tx, finished) = mpsc::channel();
+        let handle = thread::Builder::new().name(name.into()).spawn(move || {
+            task();
+            let _ = finished_tx.send(());
+        })?;
+        Ok(Self {
+            handle: Some(handle),
+            finished,
+        })
+    }
+
+    fn join_until(mut self, deadline: Instant) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if self.finished.recv_timeout(remaining).is_ok()
+            && let Some(handle) = self.handle.take()
+        {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl ClientState {
@@ -216,10 +252,11 @@ impl ClientState {
 
 pub struct CodexClient {
     state: Arc<ClientState>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    outbound: SyncSender<OutboundMessage>,
     child: Mutex<Option<Box<dyn ManagedChild>>>,
-    stdout_thread: Mutex<Option<JoinHandle<()>>>,
-    stderr_thread: Mutex<Option<JoinHandle<()>>>,
+    writer_thread: Mutex<Option<BackgroundThread>>,
+    stdout_thread: Mutex<Option<BackgroundThread>>,
+    stderr_thread: Mutex<Option<BackgroundThread>>,
     notification_receiver: Mutex<Option<Receiver<ServerNotification>>>,
     next_id: AtomicU64,
     options: ClientOptions,
@@ -240,7 +277,7 @@ impl CodexClient {
         let writer = match child.take_stdin() {
             Ok(writer) => writer,
             Err(error) => {
-                abort_startup(child.as_mut());
+                abort_startup(child.as_mut(), options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "take child stdin",
                     reason: error.to_string(),
@@ -250,7 +287,7 @@ impl CodexClient {
         let stdout = match child.take_stdout() {
             Ok(stdout) => stdout,
             Err(error) => {
-                abort_startup(child.as_mut());
+                abort_startup(child.as_mut(), options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "take child stdout",
                     reason: error.to_string(),
@@ -260,7 +297,7 @@ impl CodexClient {
         let stderr = match child.take_stderr() {
             Ok(stderr) => stderr,
             Err(error) => {
-                abort_startup(child.as_mut());
+                abort_startup(child.as_mut(), options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "take child stderr",
                     reason: error.to_string(),
@@ -276,14 +313,30 @@ impl CodexClient {
             shutdown: AtomicBool::new(false),
         });
 
-        let stdout_state = Arc::clone(&state);
-        let stdout_thread = match thread::Builder::new()
-            .name("codex-app-server-stdout".into())
-            .spawn(move || read_stdout(stdout, stdout_state))
-        {
+        let (outbound, outbound_receiver) = mpsc::sync_channel(32);
+        let writer_state = Arc::clone(&state);
+        let writer_thread = match BackgroundThread::spawn("codex-app-server-stdin", move || {
+            write_stdin(writer, outbound_receiver, writer_state)
+        }) {
             Ok(handle) => handle,
             Err(error) => {
-                abort_startup(child.as_mut());
+                abort_startup(child.as_mut(), options.shutdown_grace);
+                return Err(AdapterError::Io {
+                    operation: "start stdin writer",
+                    reason: error.to_string(),
+                });
+            }
+        };
+
+        let stdout_state = Arc::clone(&state);
+        let stdout_thread = match BackgroundThread::spawn("codex-app-server-stdout", move || {
+            read_stdout(stdout, stdout_state)
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                abort_startup(child.as_mut(), options.shutdown_grace);
+                let _ = outbound.try_send(OutboundMessage::Shutdown);
+                writer_thread.join_until(Instant::now() + options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "start stdout reader",
                     reason: error.to_string(),
@@ -292,14 +345,16 @@ impl CodexClient {
         };
         let stderr_state = Arc::clone(&state);
         let stderr_limit = options.max_stderr_bytes;
-        let stderr_thread = match thread::Builder::new()
-            .name("codex-app-server-stderr".into())
-            .spawn(move || read_stderr(stderr, stderr_state, stderr_limit))
-        {
+        let stderr_thread = match BackgroundThread::spawn("codex-app-server-stderr", move || {
+            read_stderr(stderr, stderr_state, stderr_limit)
+        }) {
             Ok(handle) => handle,
             Err(error) => {
-                abort_startup(child.as_mut());
-                let _ = stdout_thread.join();
+                abort_startup(child.as_mut(), options.shutdown_grace);
+                let _ = outbound.try_send(OutboundMessage::Shutdown);
+                let deadline = Instant::now() + options.shutdown_grace;
+                writer_thread.join_until(deadline);
+                stdout_thread.join_until(deadline);
                 return Err(AdapterError::Io {
                     operation: "start stderr reader",
                     reason: error.to_string(),
@@ -309,8 +364,9 @@ impl CodexClient {
 
         let client = Self {
             state,
-            writer: Mutex::new(Some(writer)),
+            outbound,
             child: Mutex::new(Some(child)),
+            writer_thread: Mutex::new(Some(writer_thread)),
             stdout_thread: Mutex::new(Some(stdout_thread)),
             stderr_thread: Mutex::new(Some(stderr_thread)),
             notification_receiver: Mutex::new(Some(notification_receiver)),
@@ -356,6 +412,7 @@ impl CodexClient {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + self.options.request_timeout;
         let (sender, receiver) = mpsc::channel();
         self.state.register_pending(id, sender)?;
 
@@ -365,7 +422,7 @@ impl CodexClient {
             "method": method,
             "params": params,
         });
-        if let Err(error) = self.write_message(&message) {
+        if let Err(error) = self.write_message_until(&message, deadline, method) {
             self.state
                 .pending
                 .lock()
@@ -374,7 +431,8 @@ impl CodexClient {
             return Err(error);
         }
 
-        match receiver.recv_timeout(self.options.request_timeout) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.state
@@ -394,28 +452,74 @@ impl CodexClient {
     }
 
     fn notify(&self, method: &str, params: Value) -> Result<(), AdapterError> {
-        self.write_message(&json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }))
+        self.write_message_until(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }),
+            Instant::now() + self.options.request_timeout,
+            method,
+        )
     }
 
-    fn write_message(&self, message: &Value) -> Result<(), AdapterError> {
+    fn write_message_until(
+        &self,
+        message: &Value,
+        deadline: Instant,
+        method: &str,
+    ) -> Result<(), AdapterError> {
         let mut bytes = serde_json::to_vec(message).map_err(|error| AdapterError::Protocol {
             reason: format!("failed to serialize request: {error}"),
         })?;
         bytes.push(b'\n');
-        let mut writer = self.writer.lock().expect("writer mutex poisoned");
-        let writer = writer.as_mut().ok_or(AdapterError::AlreadyShutdown)?;
-        writer.write_all(&bytes).map_err(|error| AdapterError::Io {
-            operation: "write JSON-RPC request",
-            reason: error.to_string(),
-        })?;
-        writer.flush().map_err(|error| AdapterError::Io {
-            operation: "flush JSON-RPC request",
-            reason: error.to_string(),
-        })
+        let (completion, written) = mpsc::channel();
+        let mut outbound = OutboundMessage::Write { bytes, completion };
+        loop {
+            if self.state.shutdown.load(Ordering::Acquire) {
+                return Err(AdapterError::AlreadyShutdown);
+            }
+            match self.outbound.try_send(outbound) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    outbound = returned;
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(TrySendError::Full(_)) => {
+                    return Err(AdapterError::Timeout {
+                        method: method.to_owned(),
+                    });
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(self
+                        .state
+                        .fatal_error()
+                        .unwrap_or(AdapterError::UnexpectedChildExit));
+                }
+            }
+        }
+
+        loop {
+            if self.state.shutdown.load(Ordering::Acquire) {
+                return Err(AdapterError::AlreadyShutdown);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AdapterError::Timeout {
+                    method: method.to_owned(),
+                });
+            }
+            match written.recv_timeout(remaining.min(Duration::from_millis(5))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(self
+                        .state
+                        .fatal_error()
+                        .unwrap_or(AdapterError::UnexpectedChildExit));
+                }
+            }
+        }
     }
 
     pub fn shutdown(&self) -> Result<(), AdapterError> {
@@ -423,17 +527,20 @@ impl CodexClient {
             return Ok(());
         }
 
-        self.writer.lock().expect("writer mutex poisoned").take();
+        self.state.fail(AdapterError::AlreadyShutdown);
+        let _ = self.outbound.try_send(OutboundMessage::Shutdown);
         self.state
             .notification_sender
             .lock()
             .expect("notification sender mutex poisoned")
             .take();
 
+        let started = Instant::now();
+        let deadline = started + self.options.shutdown_grace;
+        let graceful_deadline = started + self.options.shutdown_grace / 2;
         let mut first_error = None;
         let mut child = self.child.lock().expect("child mutex poisoned").take();
         if let Some(child_ref) = child.as_mut() {
-            let deadline = Instant::now() + self.options.shutdown_grace;
             let mut exited = false;
             loop {
                 match child_ref.try_wait() {
@@ -441,7 +548,7 @@ impl CodexClient {
                         exited = true;
                         break;
                     }
-                    Ok(None) if Instant::now() < deadline => {
+                    Ok(None) if Instant::now() < graceful_deadline => {
                         thread::sleep(Duration::from_millis(5))
                     }
                     Ok(None) => break,
@@ -454,13 +561,35 @@ impl CodexClient {
                     }
                 }
             }
-            if !exited && let Err(error) = child_ref.kill() {
-                first_error.get_or_insert_with(|| AdapterError::Io {
-                    operation: "kill child",
-                    reason: error.to_string(),
-                });
+            if !exited {
+                match child_ref.kill() {
+                    Ok(()) => {
+                        while Instant::now() < deadline {
+                            match child_ref.try_wait() {
+                                Ok(Some(_)) => {
+                                    exited = true;
+                                    break;
+                                }
+                                Ok(None) => thread::sleep(Duration::from_millis(2)),
+                                Err(error) => {
+                                    first_error.get_or_insert_with(|| AdapterError::Io {
+                                        operation: "poll killed child exit",
+                                        reason: error.to_string(),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert_with(|| AdapterError::Io {
+                            operation: "kill child",
+                            reason: error.to_string(),
+                        });
+                    }
+                }
             }
-            if let Err(error) = child_ref.wait() {
+            if exited && let Err(error) = child_ref.wait() {
                 first_error.get_or_insert_with(|| AdapterError::Io {
                     operation: "wait for child",
                     reason: error.to_string(),
@@ -470,12 +599,21 @@ impl CodexClient {
         drop(child);
 
         if let Some(handle) = self
+            .writer_thread
+            .lock()
+            .expect("writer thread mutex poisoned")
+            .take()
+        {
+            handle.join_until(deadline);
+        }
+
+        if let Some(handle) = self
             .stdout_thread
             .lock()
             .expect("stdout thread mutex poisoned")
             .take()
         {
-            let _ = handle.join();
+            handle.join_until(deadline);
         }
         if let Some(handle) = self
             .stderr_thread
@@ -483,7 +621,7 @@ impl CodexClient {
             .expect("stderr thread mutex poisoned")
             .take()
         {
-            let _ = handle.join();
+            handle.join_until(deadline);
         }
 
         match first_error {
@@ -516,9 +654,50 @@ impl CodexClient {
     }
 }
 
-fn abort_startup(child: &mut dyn ManagedChild) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn write_stdin(
+    mut writer: Box<dyn Write + Send>,
+    receiver: Receiver<OutboundMessage>,
+    state: Arc<ClientState>,
+) {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            OutboundMessage::Write { bytes, completion } => {
+                let result = writer
+                    .write_all(&bytes)
+                    .and_then(|_| writer.flush())
+                    .map_err(|error| AdapterError::Io {
+                        operation: "write JSON-RPC request",
+                        reason: error.to_string(),
+                    });
+                let failed = result.as_ref().err().cloned();
+                let _ = completion.send(result);
+                if let Some(error) = failed {
+                    if !state.shutdown.load(Ordering::Acquire) {
+                        state.fail(error);
+                    }
+                    return;
+                }
+            }
+            OutboundMessage::Shutdown => return,
+        }
+    }
+}
+
+fn abort_startup(child: &mut dyn ManagedChild, timeout: Duration) {
+    if child.kill().is_err() {
+        return;
+    }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(_) => return,
+        }
+    }
 }
 
 impl Drop for CodexClient {
@@ -573,42 +752,62 @@ fn dispatch_message(state: &ClientState, value: Value) -> Result<(), AdapterErro
     }
 
     if let Some(id_value) = value.get("id") {
+        if value.get("method").is_some() {
+            return Err(AdapterError::Protocol {
+                reason: "server requests with both id and method are unsupported".into(),
+            });
+        }
+        let has_result = value.get("result").is_some();
+        let has_error = value.get("error").is_some();
+        if has_result == has_error {
+            return Err(AdapterError::Protocol {
+                reason: "response must contain exactly one of result or error".into(),
+            });
+        }
         let id = id_value.as_u64().ok_or_else(|| AdapterError::Protocol {
             reason: "response id must be an unsigned integer".into(),
         })?;
+        let result = if let Some(error) = value.get("error") {
+            let error = error.as_object().ok_or_else(|| AdapterError::Protocol {
+                reason: "JSON-RPC error must be an object".into(),
+            })?;
+            let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
+                AdapterError::Protocol {
+                    reason: "JSON-RPC error is missing an integer code".into(),
+                }
+            })?;
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AdapterError::Protocol {
+                    reason: "JSON-RPC error is missing a message".into(),
+                })?;
+            Err(AdapterError::Rpc {
+                code,
+                message: message.to_owned(),
+                data: error.get("data").cloned(),
+            })
+        } else {
+            Ok(value
+                .get("result")
+                .expect("result presence validated")
+                .clone())
+        };
         let sender = state
             .pending
             .lock()
             .expect("pending mutex poisoned")
             .remove(&id);
         if let Some(sender) = sender {
-            let result = if let Some(error) = value.get("error") {
-                let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
-                    AdapterError::Protocol {
-                        reason: "JSON-RPC error is missing an integer code".into(),
-                    }
-                })?;
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AdapterError::Protocol {
-                        reason: "JSON-RPC error is missing a message".into(),
-                    })?;
-                Err(AdapterError::Rpc {
-                    code,
-                    message: message.to_owned(),
-                    data: error.get("data").cloned(),
-                })
-            } else if let Some(result) = value.get("result") {
-                Ok(result.clone())
-            } else {
-                Err(AdapterError::Protocol {
-                    reason: "response contains neither result nor error".into(),
-                })
-            };
             let _ = sender.send(result);
         }
         return Ok(());
+    }
+
+    if value.get("result").is_some() || value.get("error").is_some() {
+        return Err(AdapterError::Protocol {
+            reason: "response result or error is missing an id".into(),
+        });
     }
 
     let method =
@@ -685,8 +884,45 @@ fn find_codex_in_path(path: &OsStr) -> Result<PathBuf, AdapterError> {
     Err(AdapterError::ExecutableNotFound)
 }
 
+#[derive(Clone, Copy)]
+struct VerificationExit {
+    success: bool,
+    code: Option<i32>,
+}
+
+trait VerificationChild {
+    fn try_wait(&mut self) -> io::Result<Option<VerificationExit>>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<VerificationExit>;
+}
+
+struct SystemVerificationChild {
+    child: Child,
+}
+
+impl VerificationChild for SystemVerificationChild {
+    fn try_wait(&mut self) -> io::Result<Option<VerificationExit>> {
+        Ok(self.child.try_wait()?.map(|status| VerificationExit {
+            success: status.success(),
+            code: status.code(),
+        }))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> io::Result<VerificationExit> {
+        let status = self.child.wait()?;
+        Ok(VerificationExit {
+            success: status.success(),
+            code: status.code(),
+        })
+    }
+}
+
 fn verify_codex(executable: &Path, timeout: Duration) -> Result<(), AdapterError> {
-    let mut child = Command::new(executable)
+    let child = Command::new(executable)
         .arg(VERSION_ARG)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -695,24 +931,35 @@ fn verify_codex(executable: &Path, timeout: Duration) -> Result<(), AdapterError
         .map_err(|error| AdapterError::VersionCheckFailed {
             reason: error.to_string(),
         })?;
+    verify_spawned_codex(Box::new(SystemVerificationChild { child }), timeout)
+}
+
+fn verify_spawned_codex(
+    mut child: Box<dyn VerificationChild>,
+    timeout: Duration,
+) -> Result<(), AdapterError> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success => return Ok(()),
             Ok(Some(status)) => {
                 return Err(AdapterError::VersionCheckFailed {
-                    reason: format!("process exited with status {status}"),
+                    reason: format!("process exited with code {:?}", status.code),
                 });
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if child.kill().is_ok() {
+                    let _ = child.wait();
+                }
                 return Err(AdapterError::VersionCheckFailed {
                     reason: "process did not exit before the verification timeout".into(),
                 });
             }
             Err(error) => {
+                if child.kill().is_ok() {
+                    let _ = child.wait();
+                }
                 return Err(AdapterError::VersionCheckFailed {
                     reason: error.to_string(),
                 });
@@ -833,10 +1080,129 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BlockingWriteState {
+        entered: AtomicBool,
+        release: AtomicBool,
+    }
+
+    struct BlockingRateLimitWriter {
+        inner: LineWriter,
+        control: Arc<BlockingWriteState>,
+        process: Arc<FakeProcessState>,
+    }
+
+    impl Write for BlockingRateLimitWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if String::from_utf8_lossy(bytes).contains("account/rateLimits/read") {
+                self.control.entered.store(true, Ordering::SeqCst);
+                while !self.control.release.load(Ordering::SeqCst)
+                    && !self.process.killed.load(Ordering::SeqCst)
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "blocked pipe was closed",
+                ));
+            }
+            self.inner.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
     struct ChunkReader {
         rx: Receiver<Vec<u8>>,
         pending: VecDeque<u8>,
         state: Arc<FakeProcessState>,
+    }
+
+    #[derive(Default)]
+    struct HostileShutdownState {
+        release: AtomicBool,
+        wait_entered: AtomicBool,
+    }
+
+    struct ReleaseGatedReader {
+        rx: Receiver<Vec<u8>>,
+        pending: VecDeque<u8>,
+        control: Arc<HostileShutdownState>,
+    }
+
+    impl Read for ReleaseGatedReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.pending.is_empty() {
+                loop {
+                    match self.rx.recv_timeout(Duration::from_millis(5)) {
+                        Ok(chunk) => {
+                            self.pending.extend(chunk);
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                            if self.control.release.load(Ordering::SeqCst) =>
+                        {
+                            return Ok(0);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }
+            let count = output.len().min(self.pending.len());
+            for target in &mut output[..count] {
+                *target = self.pending.pop_front().expect("pending length checked");
+            }
+            Ok(count)
+        }
+    }
+
+    struct KillFailingChild {
+        stdin: Option<Box<dyn Write + Send>>,
+        stdout: Option<Box<dyn Read + Send>>,
+        stderr: Option<Box<dyn Read + Send>>,
+        control: Arc<HostileShutdownState>,
+    }
+
+    impl ManagedChild for KillFailingChild {
+        fn take_stdin(&mut self) -> io::Result<Box<dyn Write + Send>> {
+            self.stdin
+                .take()
+                .ok_or_else(|| io::Error::other("stdin already taken"))
+        }
+
+        fn take_stdout(&mut self) -> io::Result<Box<dyn Read + Send>> {
+            self.stdout
+                .take()
+                .ok_or_else(|| io::Error::other("stdout already taken"))
+        }
+
+        fn take_stderr(&mut self) -> io::Result<Box<dyn Read + Send>> {
+            self.stderr
+                .take()
+                .ok_or_else(|| io::Error::other("stderr already taken"))
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> io::Result<i32> {
+            self.control.wait_entered.store(true, Ordering::SeqCst);
+            while !self.control.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Ok(0)
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "kill denied",
+            ))
+        }
     }
 
     impl Read for ChunkReader {
@@ -940,6 +1306,74 @@ mod tests {
             state: Arc::clone(&state),
         };
         (Box::new(child), server, Arc::clone(&state))
+    }
+
+    fn blocking_writer_process() -> (
+        Box<dyn ManagedChild>,
+        FakeServer,
+        Arc<FakeProcessState>,
+        Arc<BlockingWriteState>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let state = Arc::new(FakeProcessState::default());
+        let control = Arc::new(BlockingWriteState::default());
+        let child = FakeChild {
+            stdin: Some(Box::new(BlockingRateLimitWriter {
+                inner: LineWriter {
+                    tx: request_tx,
+                    buffer: Vec::new(),
+                },
+                control: Arc::clone(&control),
+                process: Arc::clone(&state),
+            })),
+            stdout: Some(Box::new(ChunkReader {
+                rx: stdout_rx,
+                pending: VecDeque::new(),
+                state: Arc::clone(&state),
+            })),
+            stderr: Some(Box::new(ChunkReader {
+                rx: stderr_rx,
+                pending: VecDeque::new(),
+                state: Arc::clone(&state),
+            })),
+            state: Arc::clone(&state),
+        };
+        let server = FakeServer {
+            requests: request_rx,
+            stdout: Some(stdout_tx),
+            stderr: Some(stderr_tx),
+            state: Arc::clone(&state),
+        };
+        (Box::new(child), server, state, control)
+    }
+
+    fn kill_failing_process() -> (Box<dyn ManagedChild>, FakeServer, Arc<HostileShutdownState>) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let control = Arc::new(HostileShutdownState::default());
+        let server_state = Arc::new(FakeProcessState::default());
+        let child = KillFailingChild {
+            stdin: Some(Box::new(LineWriter {
+                tx: request_tx,
+                buffer: Vec::new(),
+            })),
+            stdout: Some(Box::new(ReleaseGatedReader {
+                rx: stdout_rx,
+                pending: VecDeque::new(),
+                control: Arc::clone(&control),
+            })),
+            stderr: Some(Box::new(io::empty())),
+            control: Arc::clone(&control),
+        };
+        let server = FakeServer {
+            requests: request_rx,
+            stdout: Some(stdout_tx),
+            stderr: None,
+            state: server_state,
+        };
+        (Box::new(child), server, control)
     }
 
     fn options() -> ClientOptions {
@@ -1236,5 +1670,236 @@ mod tests {
 
         assert_eq!(error, AdapterError::MalformedJson);
         assert!(state.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocked_pipe_write_respects_the_request_deadline() {
+        let (child, server, _state, control) = blocking_writer_process();
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            thread::sleep(Duration::from_millis(500));
+        });
+        let mut test_options = options();
+        test_options.request_timeout = Duration::from_millis(50);
+        let client = Arc::new(CodexClient::start_with_child(child, test_options).unwrap());
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_client = Arc::clone(&client);
+        let request_thread = thread::spawn(move || {
+            let _ = result_tx.send(request_client.read_rate_limits());
+        });
+
+        while !control.entered.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let result = result_rx.recv_timeout(Duration::from_millis(200));
+        control.release.store(true, Ordering::SeqCst);
+        let _ = request_thread.join();
+        let _ = client.shutdown();
+        let _ = server_thread.join();
+
+        assert!(matches!(
+            result,
+            Ok(Err(AdapterError::Timeout { ref method }))
+                if method == "account/rateLimits/read"
+        ));
+    }
+
+    #[test]
+    fn shutdown_completes_while_pipe_writer_is_blocked() {
+        let (child, server, _state, control) = blocking_writer_process();
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            thread::sleep(Duration::from_millis(500));
+        });
+        let mut test_options = options();
+        test_options.request_timeout = Duration::from_secs(2);
+        test_options.shutdown_grace = Duration::from_millis(80);
+        let client = Arc::new(CodexClient::start_with_child(child, test_options).unwrap());
+        let request_client = Arc::clone(&client);
+        let request_thread = thread::spawn(move || request_client.read_rate_limits());
+        while !control.entered.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let shutdown_client = Arc::clone(&client);
+        let shutdown_thread = thread::spawn(move || {
+            let _ = shutdown_tx.send(shutdown_client.shutdown());
+        });
+
+        let result = shutdown_rx.recv_timeout(Duration::from_millis(250));
+        control.release.store(true, Ordering::SeqCst);
+        let _ = shutdown_thread.join();
+        let _ = request_thread.join();
+        let _ = server_thread.join();
+
+        assert!(result.is_ok(), "shutdown exceeded its bounded deadline");
+    }
+
+    #[test]
+    fn shutdown_is_bounded_when_kill_fails_and_stdout_never_reaches_eof() {
+        let (child, server, control) = kill_failing_process();
+        let server_control = Arc::clone(&control);
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            while !server_control.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut test_options = options();
+        test_options.shutdown_grace = Duration::from_millis(80);
+        let client = Arc::new(CodexClient::start_with_child(child, test_options).unwrap());
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let shutdown_client = Arc::clone(&client);
+        let shutdown_thread = thread::spawn(move || {
+            let _ = shutdown_tx.send(shutdown_client.shutdown());
+        });
+
+        let result = shutdown_rx.recv_timeout(Duration::from_millis(250));
+        control.release.store(true, Ordering::SeqCst);
+        let _ = shutdown_thread.join();
+        let _ = server_thread.join();
+
+        assert!(
+            matches!(
+                result,
+                Ok(Err(AdapterError::Io {
+                    operation: "kill child",
+                    ..
+                }))
+            ),
+            "shutdown must return the kill error within its deadline"
+        );
+        assert!(
+            !control.wait_entered.load(Ordering::SeqCst),
+            "shutdown must not call an unbounded wait after kill fails"
+        );
+    }
+
+    #[test]
+    fn shutdown_immediately_fails_registered_pending_requests() {
+        let (child, server, _state) = fake_process(true);
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let release_server = Arc::new(AtomicBool::new(false));
+        let server_release = Arc::clone(&release_server);
+        let server_thread = thread::spawn(move || {
+            server.initialize();
+            let _request = server.recv_json();
+            request_seen_tx.send(()).unwrap();
+            while !server_release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut test_options = options();
+        test_options.request_timeout = Duration::from_secs(1);
+        test_options.shutdown_grace = Duration::from_millis(80);
+        let client = Arc::new(CodexClient::start_with_child(child, test_options).unwrap());
+        let (result_tx, result_rx) = mpsc::channel();
+        let request_client = Arc::clone(&client);
+        let request_thread = thread::spawn(move || {
+            let _ = result_tx.send(request_client.read_rate_limits());
+        });
+        request_seen_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+
+        client.shutdown().unwrap();
+        let result = result_rx.recv_timeout(Duration::from_millis(150));
+        release_server.store(true, Ordering::SeqCst);
+        let _ = request_thread.join();
+        let _ = server_thread.join();
+
+        assert!(matches!(result, Ok(Err(AdapterError::AlreadyShutdown))));
+        assert_eq!(client.pending_request_count(), 0);
+    }
+
+    #[derive(Default)]
+    struct VerificationProcessState {
+        killed: AtomicBool,
+        waited: AtomicBool,
+        dropped: AtomicBool,
+    }
+
+    struct TryWaitFailingVerificationChild {
+        state: Arc<VerificationProcessState>,
+    }
+
+    impl Drop for TryWaitFailingVerificationChild {
+        fn drop(&mut self) {
+            self.state.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl VerificationChild for TryWaitFailingVerificationChild {
+        fn try_wait(&mut self) -> io::Result<Option<VerificationExit>> {
+            Err(io::Error::other("try_wait failed"))
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.state.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn wait(&mut self) -> io::Result<VerificationExit> {
+            self.state.waited.store(true, Ordering::SeqCst);
+            Ok(VerificationExit {
+                success: false,
+                code: Some(1),
+            })
+        }
+    }
+
+    #[test]
+    fn version_try_wait_error_kills_waits_and_releases_the_child() {
+        let state = Arc::new(VerificationProcessState::default());
+        let child = TryWaitFailingVerificationChild {
+            state: Arc::clone(&state),
+        };
+
+        let error = verify_spawned_codex(Box::new(child), Duration::from_millis(20)).unwrap_err();
+
+        assert!(matches!(error, AdapterError::VersionCheckFailed { .. }));
+        assert!(state.killed.load(Ordering::SeqCst));
+        assert!(state.waited.load(Ordering::SeqCst));
+        assert!(state.dropped.load(Ordering::SeqCst));
+    }
+
+    fn protocol_test_state() -> ClientState {
+        let (notification_sender, _notification_receiver) = mpsc::channel();
+        ClientState {
+            pending: Mutex::new(HashMap::new()),
+            fatal: Mutex::new(None),
+            notification_sender: Mutex::new(Some(notification_sender)),
+            stderr: Mutex::new(Vec::new()),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_jsonrpc_and_invalid_response_envelopes() {
+        let missing_version = dispatch_message(&protocol_test_state(), json!({"id":1,"result":{}}));
+        assert!(matches!(
+            missing_version,
+            Err(AdapterError::Protocol { .. })
+        ));
+
+        let ambiguous_state = protocol_test_state();
+        let (ambiguous_sender, _ambiguous_receiver) = mpsc::channel();
+        ambiguous_state
+            .register_pending(2, ambiguous_sender)
+            .unwrap();
+        let ambiguous = dispatch_message(
+            &ambiguous_state,
+            json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "result":{},
+                "error":{"code":-1,"message":"bad"}
+            }),
+        );
+        assert!(matches!(ambiguous, Err(AdapterError::Protocol { .. })));
+
+        let server_request = dispatch_message(
+            &protocol_test_state(),
+            json!({"jsonrpc":"2.0","id":99,"method":"server/call","params":{}}),
+        );
+        assert!(matches!(server_request, Err(AdapterError::Protocol { .. })));
     }
 }
