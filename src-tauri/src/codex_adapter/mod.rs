@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SendError, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -336,7 +336,7 @@ impl CodexClient {
         options: ClientOptions,
     ) -> Result<Self, AdapterError> {
         if let Err(error) = ensure_reaper() {
-            abort_startup(child.as_mut(), options.shutdown_grace);
+            handoff_startup_child(child, options.shutdown_grace);
             return Err(AdapterError::Io {
                 operation: "start resource reaper",
                 reason: error.to_string(),
@@ -345,7 +345,7 @@ impl CodexClient {
         let writer = match child.take_stdin() {
             Ok(writer) => writer,
             Err(error) => {
-                abort_startup(child.as_mut(), options.shutdown_grace);
+                handoff_startup_child(child, options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "take child stdin",
                     reason: error.to_string(),
@@ -355,7 +355,7 @@ impl CodexClient {
         let stdout = match child.take_stdout() {
             Ok(stdout) => stdout,
             Err(error) => {
-                abort_startup(child.as_mut(), options.shutdown_grace);
+                handoff_startup_child(child, options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "take child stdout",
                     reason: error.to_string(),
@@ -365,7 +365,7 @@ impl CodexClient {
         let stderr = match child.take_stderr() {
             Ok(stderr) => stderr,
             Err(error) => {
-                abort_startup(child.as_mut(), options.shutdown_grace);
+                handoff_startup_child(child, options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "take child stderr",
                     reason: error.to_string(),
@@ -388,7 +388,7 @@ impl CodexClient {
         }) {
             Ok(handle) => handle,
             Err(error) => {
-                abort_startup(child.as_mut(), options.shutdown_grace);
+                handoff_startup_child(child, options.shutdown_grace);
                 return Err(AdapterError::Io {
                     operation: "start stdin writer",
                     reason: error.to_string(),
@@ -402,7 +402,7 @@ impl CodexClient {
         }) {
             Ok(handle) => handle,
             Err(error) => {
-                abort_startup(child.as_mut(), options.shutdown_grace);
+                handoff_startup_child(child, options.shutdown_grace);
                 let _ = outbound.try_send(OutboundMessage::Shutdown);
                 let mut writer_thread = writer_thread;
                 let _ = writer_thread.join_until(Instant::now() + options.shutdown_grace);
@@ -419,7 +419,7 @@ impl CodexClient {
         }) {
             Ok(handle) => handle,
             Err(error) => {
-                abort_startup(child.as_mut(), options.shutdown_grace);
+                handoff_startup_child(child, options.shutdown_grace);
                 let _ = outbound.try_send(OutboundMessage::Shutdown);
                 let deadline = Instant::now() + options.shutdown_grace;
                 let mut writer_thread = writer_thread;
@@ -757,36 +757,13 @@ impl CodexClient {
 
         // Drop 不能无限等待，但也不能把仍然拥有子进程和管道的句柄直接丢掉。
         // 将所有权交给有名字的后台回收线程，持续终止子进程并等待读写线程退出。
-        let mut resources = Some((child, writer, stdout, stderr));
-        for _ in 0..2 {
-            let sender = match ensure_reaper() {
-                Ok(sender) => sender,
-                Err(error) => {
-                    eprintln!("codex-app-server reaper unavailable: {error}");
-                    break;
-                }
-            };
-            match sender.send(resources.take().expect("reaper resources present")) {
-                Ok(()) => return,
-                Err(SendError(returned)) => {
-                    resources = Some(returned);
-                    REAPER_SENDER
-                        .get()
-                        .expect("reaper sender slot initialized")
-                        .lock()
-                        .expect("reaper sender mutex poisoned")
-                        .take();
-                }
-            }
-        }
-        // supervisor 连续重建失败时保留资源所有权，避免 Drop 再次无限等待。
-        eprintln!("codex-app-server reaper supervisor unavailable; resources queued for retry");
-        if let Some(resources) = resources {
-            REAPER_BACKLOG
-                .get_or_init(|| Mutex::new(VecDeque::new()))
-                .lock()
-                .expect("reaper backlog mutex poisoned")
-                .push_back(resources);
+        REAPER_BACKLOG
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+            .expect("reaper backlog mutex poisoned")
+            .push_back((child, writer, stdout, stderr));
+        if let Err(error) = ensure_reaper() {
+            eprintln!("codex-app-server reaper unavailable; resources queued for retry: {error}");
         }
     }
 
@@ -860,6 +837,18 @@ fn abort_startup(child: &mut dyn ManagedChild, timeout: Duration) {
             Ok(None) => thread::sleep(Duration::from_millis(2)),
             Err(_) => return,
         }
+    }
+}
+
+fn handoff_startup_child(mut child: Box<dyn ManagedChild>, timeout: Duration) {
+    abort_startup(child.as_mut(), timeout);
+    if child.try_wait().ok().flatten().is_none() {
+        REAPER_BACKLOG
+            .get_or_init(|| Mutex::new(VecDeque::new()))
+            .lock()
+            .expect("reaper backlog mutex poisoned")
+            .push_back((Some(child), None, None, None));
+        let _ = ensure_reaper();
     }
 }
 
