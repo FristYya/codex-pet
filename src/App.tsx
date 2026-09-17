@@ -14,6 +14,8 @@ const initialSnapshot: QuotaSnapshot = {
 
 function App() {
   const resizeForDetails = (expanded: boolean) => {
+    // 浏览器预览没有 Tauri runtime；只在桌面壳中调整原生窗口尺寸。
+    if (!("__TAURI_INTERNALS__" in window)) return;
     void getCurrentWindow().setSize(
       expanded ? new LogicalSize(340, 390) : new LogicalSize(164, 154),
     );
