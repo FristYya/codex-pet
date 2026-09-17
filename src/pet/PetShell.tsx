@@ -26,7 +26,13 @@ function PetFace({ availability }: Pick<QuotaSnapshot, "availability">) {
 
 function resetLabel(resetsAt: number | null) {
   if (!resetsAt) return "重置时间未知";
-  return `重置于 ${new Date(resetsAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
+  const minutes = Math.max(0, Math.floor((resetsAt - Date.now() / 1000) / 60));
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const remainder = minutes % 60;
+  if (days > 0) return `重置于 ${days}D ${hours}H`;
+  if (hours > 0) return `重置于 ${hours}H ${remainder}M`;
+  return `重置于 ${remainder}M`;
 }
 
 export function PetShell({ snapshot, onExpandedChange }: PetShellProps) {
@@ -55,7 +61,7 @@ export function PetShell({ snapshot, onExpandedChange }: PetShellProps) {
           <div className="quota-row-heading"><strong>{window.name}</strong><span>{Math.round(window.remainingPercent)}% 剩余</span></div>
           <div className="quota-track" aria-hidden="true"><span style={{ width: `${window.remainingPercent}%` }} /></div>
           <small>{resetLabel(window.resetsAt)}</small>
-        </article>)}</div> : <div className="empty-state"><strong>额度暂不可用</strong><span>请确认 Codex CLI 已登录</span></div>}
+        </article>)}</div> : <div className="empty-state"><strong>{snapshot.message ?? "额度暂不可用"}</strong><span>请确认 Codex CLI 已登录</span></div>}
         <footer>{snapshot.planType ? `${snapshot.planType} 方案` : "等待本机 Codex"}</footer>
       </section>}
     </main>

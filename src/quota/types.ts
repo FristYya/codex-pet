@@ -15,5 +15,5 @@ export type QuotaSnapshot = {
   planType: string | null;
   fetchedAt: number;
   stale: boolean;
+  message?: string | null;
 };
-
