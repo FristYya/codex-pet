@@ -6,7 +6,7 @@ Codex Pet 是一个 Windows 桌面悬浮额度监控桌宠，用轻量透明小�
 
 ## 当前状态
 
-V0.1 面向 Windows 10/11 开发。透明桌宠壳、系统托盘、额度响应领域模型和本地 JSON-RPC 客户端已经建立，实时额度接入与持久化仍在开发中。
+V0.1 面向 Windows 10/11 开发。桌宠现在会通过本机已登录的 Codex CLI App Server 读取真实额度，并在启动后显示最紧张窗口的剩余百分比；持久化和多显示器能力仍在后续阶段。
 
 ## V0.1 目标
 
@@ -59,7 +59,9 @@ pnpm test --run
 
 程序会直接启动 `codex app-server --stdio`，完成初始化握手后调用 `account/rateLimits/read`。它不会启动模型回合，也不会发送提示词。
 
-收到 `account/rateLimits/updated` 或 `account/updated` 通知后，应用会重新读取完整额度快照，而不是用稀疏通知覆盖旧数据。
+Rust 适配器已识别 `account/rateLimits/updated` 和 `account/updated` 通知；当前 UI 先通过 60 秒完整刷新确保数据稳定，事件驱动刷新将在下一次联调中接入。
+
+正式运行要求 Codex CLI 已安装并使用 ChatGPT 账号登录。桌宠不会读取 `auth.json`、Token、Cookie 或会话文件。
 
 ## 隐私边界
 

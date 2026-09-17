@@ -1,10 +1,8 @@
-# Changelog
+# 更新记录
 
-All notable changes to this project will be documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
+## 未发布
 
-## [Unreleased]
-
-### Added
-
-- Initial Tauri 2, React, TypeScript, and Rust project scaffold.
-- Open-source project documentation and privacy baseline.
+- 接入真实 Codex CLI App Server 额度读取。
+- 桌宠启动后通过 Tauri command 获取统一 `QuotaSnapshot`。
+- 收起状态显示最紧张 Codex 窗口的剩余百分比，展开状态显示窗口和重置倒计时。
+- 增加 60 秒自动刷新和 stale/不可用提示。
