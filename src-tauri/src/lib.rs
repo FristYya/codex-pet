@@ -1,15 +1,185 @@
 use codex_adapter::{AdapterError, CodexClient, ServerNotification};
 use quota::{QuotaRefreshCoordinator, QuotaSnapshot, spawn_notification_bridge};
 use serde_json::Value;
-use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::{
+    sync::{Arc, Mutex, mpsc::{Receiver, Sender, channel}},
+    thread,
+    time::Duration,
+};
 use tauri::{
     Emitter, Manager,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
+use window_state::{
+    MonitorContext, MonitorProvider, RuntimeWindowState, resolve_monitor, resolve_startup_monitor,
+};
 
 pub mod codex_adapter;
 pub mod quota;
+pub mod settings;
+pub mod window_state;
+
+struct TauriMonitorProvider<'a, R: tauri::Runtime> {
+    window: &'a tauri::Window<R>,
+}
+
+struct TauriWebviewMonitorProvider<'a, R: tauri::Runtime> {
+    window: &'a tauri::WebviewWindow<R>,
+}
+
+fn monitor_context(monitor: tauri::Monitor) -> MonitorContext {
+    let work_area = monitor.work_area();
+    MonitorContext::new(
+        monitor.name().cloned(),
+        settings::PhysicalRect::new(
+            f64::from(work_area.position.x),
+            f64::from(work_area.position.y),
+            f64::from(work_area.size.width),
+            f64::from(work_area.size.height),
+        ),
+        monitor.scale_factor(),
+    )
+}
+
+impl<R: tauri::Runtime> MonitorProvider for TauriMonitorProvider<'_, R> {
+    type Error = tauri::Error;
+
+    fn current_monitor(&self) -> Result<Option<MonitorContext>, Self::Error> {
+        self.window
+            .current_monitor()
+            .map(|monitor| monitor.map(monitor_context))
+    }
+
+    fn primary_monitor(&self) -> Result<Option<MonitorContext>, Self::Error> {
+        self.window
+            .primary_monitor()
+            .map(|monitor| monitor.map(monitor_context))
+    }
+
+    fn available_monitors(&self) -> Result<Vec<MonitorContext>, Self::Error> {
+        self.window
+            .available_monitors()
+            .map(|monitors| monitors.into_iter().map(monitor_context).collect())
+    }
+}
+
+impl<R: tauri::Runtime> MonitorProvider for TauriWebviewMonitorProvider<'_, R> {
+    type Error = tauri::Error;
+    fn current_monitor(&self) -> Result<Option<MonitorContext>, Self::Error> {
+        self.window
+            .current_monitor()
+            .map(|monitor| monitor.map(monitor_context))
+    }
+    fn primary_monitor(&self) -> Result<Option<MonitorContext>, Self::Error> {
+        self.window
+            .primary_monitor()
+            .map(|monitor| monitor.map(monitor_context))
+    }
+    fn available_monitors(&self) -> Result<Vec<MonitorContext>, Self::Error> {
+        self.window
+            .available_monitors()
+            .map(|monitors| monitors.into_iter().map(monitor_context).collect())
+    }
+}
+
+struct WindowPersistenceState {
+    runtime: Mutex<RuntimeWindowState>,
+    writer: Option<Arc<Mutex<settings::DebouncedSettingsWriter<settings::WindowsReplace>>>>,
+    scheduler: Mutex<Option<Sender<u64>>>,
+}
+
+impl WindowPersistenceState {
+    fn new(
+        runtime: RuntimeWindowState,
+        target: std::path::PathBuf,
+        writable: bool,
+    ) -> Self {
+        let writer = writable.then(|| {
+            Arc::new(Mutex::new(settings::DebouncedSettingsWriter::new(
+                settings::WindowsReplace,
+                target,
+            )))
+        });
+        let scheduler = writer.as_ref().map(|writer| {
+            let (sender, receiver) = channel();
+            spawn_persistence_scheduler(Arc::clone(writer), receiver);
+            sender
+        });
+        Self {
+            runtime: Mutex::new(runtime),
+            writer,
+            scheduler: Mutex::new(scheduler),
+        }
+    }
+
+    fn schedule(&self, snapshot: settings::UiSettings) {
+        let (Some(writer), Ok(scheduler)) = (&self.writer, self.scheduler.lock()) else {
+            return;
+        };
+        let Some(scheduler) = scheduler.as_ref() else {
+            return;
+        };
+        let token = match writer.lock() {
+            Ok(mut writer) => writer.schedule(snapshot),
+            Err(_) => return,
+        };
+        let _ = scheduler.send(token);
+    }
+
+    fn moved<R: tauri::Runtime>(
+        &self,
+        window: &tauri::Window<R>,
+        position: tauri::PhysicalPosition<i32>,
+    ) {
+        let monitor = resolve_monitor(&TauriMonitorProvider { window });
+        let snapshot = self.runtime.lock().ok().and_then(|mut runtime| {
+            runtime.handle_moved_position(position.x, position.y, monitor.as_ref())
+        });
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        self.schedule(snapshot);
+    }
+    fn shutdown(&self) {
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.coordinator_mut().begin_shutdown();
+        }
+        if let Ok(mut scheduler) = self.scheduler.lock() {
+            scheduler.take();
+        }
+        if let Some(writer) = &self.writer
+            && let Ok(mut writer) = writer.lock()
+        {
+            let _ = writer.shutdown();
+        }
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.coordinator_mut().mark_stopped();
+        }
+    }
+}
+
+fn spawn_persistence_scheduler(
+    writer: Arc<Mutex<settings::DebouncedSettingsWriter<settings::WindowsReplace>>>,
+    receiver: Receiver<u64>,
+) {
+    thread::spawn(move || {
+        while let Ok(mut token) = receiver.recv() {
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(650)) {
+                    Ok(newer_token) => token = newer_token,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if let Ok(mut writer) = writer.lock() {
+                            let _ = writer.flush_if_current(token);
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        }
+    });
+}
 
 struct AppState {
     coordinator: Arc<QuotaRefreshCoordinator>,
@@ -124,6 +294,11 @@ fn read_quota(state: tauri::State<'_, AppState>) -> QuotaSnapshot {
 }
 
 fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::RunEvent) {
+    if matches!(event, tauri::RunEvent::Exit)
+        && let Some(state) = app.try_state::<WindowPersistenceState>()
+    {
+        state.shutdown();
+    }
     if let Some(state) = app.try_state::<AppState>() {
         state.on_run_event(&event);
     }
@@ -135,6 +310,49 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![read_quota])
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            let settings_dir = app.path().app_config_dir()?;
+            std::fs::create_dir_all(&settings_dir)?;
+            let settings_path = settings_dir.join("ui-settings.json");
+            let loaded = settings::load_settings(&settings_path);
+            let window = app
+                .get_webview_window("main")
+                .ok_or_else(|| std::io::Error::other("missing main window"))?;
+            let monitor = resolve_startup_monitor(&TauriWebviewMonitorProvider { window: &window });
+            let initial_rect = monitor
+                .as_ref()
+                .map(|monitor| settings::initial_collapsed_rect(
+                    &loaded,
+                    monitor.work_area,
+                    monitor.scale_factor,
+                ))
+                .unwrap_or(settings::PhysicalRect::new(
+                    0.0,
+                    0.0,
+                    settings::CURRENT_COLLAPSED_WIDTH,
+                    settings::CURRENT_COLLAPSED_HEIGHT,
+                ));
+            let saved_before_restore = loaded.settings.clone();
+            let writable_settings = loaded.may_overwrite_source;
+            let mut runtime = RuntimeWindowState::from_restored_settings(
+                initial_rect,
+                loaded.settings,
+                monitor.as_ref(),
+            );
+            runtime
+                .coordinator_mut()
+                .expect_programmatic_move(initial_rect);
+            let persist_startup_state = writable_settings
+                && runtime.persisted_settings() != &saved_before_restore;
+            let startup_snapshot = persist_startup_state.then(|| runtime.persisted_settings().clone());
+            let persistence = WindowPersistenceState::new(runtime, settings_path, writable_settings);
+            if let Some(snapshot) = startup_snapshot {
+                persistence.schedule(snapshot);
+            }
+            app.manage(persistence);
+            let _ = window.set_position(tauri::PhysicalPosition::new(
+                initial_rect.x as i32,
+                initial_rect.y as i32,
+            ));
             let handle = app.handle().clone();
             app.manage(AppState::new(
                 || CodexClient::connect(Default::default()),
@@ -172,13 +390,23 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+            }
+
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::Moved(position) => {
+                if let Some(state) = window.app_handle().try_state::<WindowPersistenceState>() {
+                    state.moved(window, *position);
+                }
+            }
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("error while building Codex Pet")

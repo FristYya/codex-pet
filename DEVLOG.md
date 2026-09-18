@@ -1,5 +1,12 @@
 # 开发日志
 
+## 2026-09-18：桌宠位置持久化
+
+- Rust 设置层新增版本化 UI 配置、损坏配置 fallback、未来版本只读保护、Windows 原子替换和退出同步 flush。
+- 收起位置仅以目标显示器 work area 的相对逻辑坐标持久化；启动使用目标当前 DPI 生成 164×154 logical 的运行时矩形并 clamp。
+- 生产链路为 `WindowEvent::Moved → RuntimeWindowState → 单一 token debounce scheduler → atomic writer`；启动产生的程序移动会被一次性消费。
+- 已在本机启动 Tauri 桌宠，确认首次启动在主显示器右下角生成 `ui-settings.json`，且记录当前显示器和 150% DPI 下的相对逻辑位置。
+
 ## 2026-09-17：真实额度链路
 
 - 已验证本机 Codex CLI 可被发现，版本为 `0.155.0-alpha.2.6`。

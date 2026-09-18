@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- 保存并恢复桌宠收起位置：配置使用版本化 `ui-settings.json`，Windows 上同目录临时文件同步后以 `ReplaceFileW` 原子替换。
+- 启动时按主显示器 work area 恢复或在右下角以 16 logical px 边距首次定位；位置以显示器 work area 相对逻辑坐标保存，并按当前 DPI 恢复、完整可见 clamp。
+- 窗口移动使用单一 650ms token debounce 调度器；退出时停止接收移动并同步写入最后待保存位置。
 - 接入 `account/rateLimits/updated` 事件即时刷新：Rust 端 800ms 防抖后重新读取完整额度，React 通过 `quota://updated` 接收完整快照。
 - 启动读取、60 秒对账和手动刷新统一使用 single-flight 协调器，刷新失败保留最后成功额度并标记 stale。
 - 接入真实 Codex CLI App Server 额度读取。
