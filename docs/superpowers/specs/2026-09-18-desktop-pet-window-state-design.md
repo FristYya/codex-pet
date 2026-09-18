@@ -41,7 +41,7 @@
 }
 ```
 
-`window.x/y` 是相对于目标显示器当前 `work_area` 左上角的逻辑坐标，不是跨显示器的全局逻辑坐标。`width/height` 是收起桌宠的逻辑尺寸。`monitorKey` 优先使用显示器名称；名称不可用时使用物理位置与物理尺寸组成的弱指纹，并以 `monitorName` 作为第二匹配条件。
+`window.x/y` 是相对于目标显示器当前 `work_area` 左上角的逻辑坐标，不是跨显示器的全局逻辑坐标。`width/height` 用于兼容、校验和未来迁移；V0.1 不允许用户 resize，当前程序定义的合法 collapsed size 是运行时权威值，读取到异常或过期尺寸时必须使用该权威值，旧配置不得永久覆盖新版预期尺寸。`monitorKey` 优先使用显示器名称；名称不可用时使用物理位置与物理尺寸组成的弱指纹，并以 `monitorName` 作为第二匹配条件。
 
 保存的数据不包含 Codex 原始响应、Account ID、邮箱、Token、Cookie、Prompt、Session 或源码。
 
@@ -56,7 +56,7 @@
 
 ## 原子持久化与写入节流
 
-设置写入使用同目录原子写流程：写入临时文件、flush 文件内容、替换/rename 目标文件；替换失败时保留上一份有效 `ui-settings.json`。临时文件不会成为有效配置来源。
+设置写入在 Windows 使用同目录原子写流程：创建同目录临时文件、写入、`flush`/`sync_all`，再用支持 replace-existing 的安全替换操作替换目标文件。实现不得假设普通 rename 可以覆盖已存在目标，也不得采用“先删除旧 `ui-settings.json`，再 rename”的流程；替换失败时必须保留上一份有效配置。临时文件不会成为有效配置来源。
 
 窗口移动只更新内存中的最后 `collapsedRect`。连续移动使用约 500–800ms debounce，静止后才持久化，避免每个 mousemove 写磁盘。退出时取消待执行 debounce 并同步 flush 最后内存状态；因此“刚完成拖动但 debounce 尚未触发即退出”仍保存最后位置。
 
@@ -80,7 +80,7 @@
 
 ## 展开布局
 
-持久化永远只保存 `collapsedRect`。展开状态使用临时窗口矩形，收起时恢复收起矩形，不让展开导致位置漂移。
+持久化永远只保存 `collapsedRect`。展开状态使用临时窗口矩形，收起时恢复收起矩形，不让展开导致位置漂移。四个候选 expandedRect 都以 collapsedRect 为固定视觉 anchor：无论选择哪个方向，宠物本体在屏幕上的物理位置都不得因展开而跳动。
 
 展开时 Rust 在当前显示器 work area 内评估右下、左下、右上、左上四个候选 Rect，计算每个候选 Rect 与 work area 的可见面积，选择面积最大者；完全并列时按右下、左下、右上、左上的确定顺序决策。选定后对临时 Rect clamp，并把 `horizontal: left|right` 与 `vertical: up|down` 传给 React。React 只据此切换 CSS class，令详情卡片尽可能完整可见。
 
@@ -95,7 +95,7 @@ Tray 菜单包含：
 - 刷新额度
 - 退出
 
-锁定、始终置顶和开机启动使用可勾选菜单项。每次托盘操作先执行原生窗口或 autostart 动作；仅在成功后更新内存设置、菜单勾选状态和待持久化状态。失败时恢复原有状态和菜单显示，避免状态分叉。
+锁定、始终置顶和开机启动使用可勾选菜单项。Window、Tray 和 Autostart 原生操作经由薄抽象层或等价的可测试边界调用。每次托盘操作先执行原生窗口或 autostart 动作；仅在成功后更新内存设置、菜单勾选状态和待持久化状态。失败时恢复原有状态和菜单显示，避免状态分叉。Rust 单测必须覆盖成功后更新、失败保持旧状态和 Tray checkbox 回滚。
 
 “显示宠物”只调用 `show`，不主动抢焦点；“隐藏宠物”调用 `hide`。`CloseRequested` 严格执行 `prevent_close → hide → visible=false`；进程的真正退出只通过 Tray “退出”与 `RunEvent::Exit` 生命周期处理。
 
@@ -108,7 +108,7 @@ Tray 菜单包含：
 
 ## Autostart
 
-应用启动时，Tray 的开机启动勾选状态以 OS 插件 `is_enabled` 的实际返回值为准；不会仅因为 JSON 中的旧偏好就显示为已启用。用户从 Tray 启用或关闭时，先调用官方插件的 `enable` 或 `disable`，成功后才更新 `autostart` 设置和菜单状态；调用失败则保留原状态。自动化测试只验证该抽象层与状态同步逻辑，真实 Windows 登录后是否自动启动只归入真机验证。
+应用启动时按 `OS is_enabled() → 内存 settings → Tray checkbox` 同步，OS 插件 `is_enabled` 的实际返回值是事实源。启动时不会因为 JSON 中保存了 `autostart=true` 而主动重新 enable。只有用户从 Codex Pet 主动修改时，才调用官方插件的 `enable` 或 `disable`；成功后才更新 `autostart` 设置和菜单状态，调用失败则保留原状态。自动化测试只验证该抽象层与状态同步逻辑，真实 Windows 登录后是否自动启动只归入真机验证。
 
 ## 启动顺序
 
@@ -128,12 +128,12 @@ Rust 单元测试覆盖不依赖真实显示器的纯逻辑：
 | 范围 | 验收用例 |
 | --- | --- |
 | 默认与版本 | 默认配置；v1 读写；字段缺失；损坏配置 fallback；旧版本迁移；未来版本只读保护且不覆写 |
-| 原子写 | 临时文件写入/flush/replace 成功；写入或 replace 失败时上一份有效配置不受破坏 |
+| 原子写 | 同目录临时文件写入/flush/`sync_all`/replace-existing 成功；写入或 replace 失败时上一份有效配置不受破坏，且不采用删除旧文件的降级流程 |
 | 节流与退出 | 连续快速移动只持久化最后状态；debounce 未落盘时退出 flush 最后位置 |
-| 位置恢复 | 首次右下；保存/恢复 work-area 相对坐标；主屏回退；缺失显示器回退；坐标 clamp；完整窗口可见 |
+| 位置恢复 | 首次右下；保存/恢复 work-area 相对坐标；主屏回退；缺失显示器回退；坐标 clamp；完整窗口可见；异常/过期配置尺寸回退当前合法 collapsed size |
 | DPI | 100%、125%、150%；物理到相对逻辑保存；目标显示器当前 scale factor 恢复；不同 DPI 双屏 |
-| 展开 | 四个候选 Rect 的可见面积决策；并列方向顺序；持久化只使用 collapsedRect |
-| 状态 | Tray 成功后才恢复 locked；always-on-top；visible；CloseRequested hide 语义 |
+| 展开 | 四个候选 Rect 的可见面积决策；并列方向顺序；固定 collapsedRect 视觉 anchor；持久化只使用 collapsedRect |
+| 状态 | Tray 成功后才恢复 locked；always-on-top；visible；CloseRequested hide 语义；原生操作失败保持旧内存状态并回滚 Tray checkbox |
 | Autostart | `is_enabled` 初始化；enable/disable 成功后的同步；失败后的状态回滚 |
 | 托盘 | 菜单勾选与内存/原生结果一致；刷新额度继续复用既有 `read_quota` 协调器 |
 
