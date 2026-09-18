@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalSize } from "@tauri-apps/api/dpi";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PetShell } from "./pet/PetShell";
 import type { QuotaSnapshot } from "./quota/types";
@@ -17,20 +18,51 @@ const initialSnapshot: QuotaSnapshot = {
 
 function App() {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot>(initialSnapshot);
+  const hasSuccessfulSnapshot = useRef(false);
+  const acceptSnapshot = useCallback((nextSnapshot: QuotaSnapshot) => {
+    hasSuccessfulSnapshot.current = true;
+    setSnapshot(nextSnapshot);
+  }, []);
+  const markUpdateFailed = useCallback((error: unknown) => {
+    const message = `更新失败：${String(error)}`;
+    setSnapshot((previous) => hasSuccessfulSnapshot.current
+      ? { ...previous, stale: true, message }
+      : { ...initialSnapshot, message });
+  }, []);
   const refresh = useCallback(async () => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     try {
-      setSnapshot(await invoke<QuotaSnapshot>("read_quota"));
+      acceptSnapshot(await invoke<QuotaSnapshot>("read_quota"));
     } catch (error) {
-      setSnapshot((previous) => ({ ...previous, stale: previous.windows.length > 0, message: String(error) }));
+      markUpdateFailed(error);
     }
-  }, []);
+  }, [acceptSnapshot, markUpdateFailed]);
 
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 60_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<QuotaSnapshot>("quota://updated", (event) => {
+      if (!disposed) acceptSnapshot(event.payload);
+    }).then((registeredUnlisten) => {
+      if (disposed) registeredUnlisten();
+      else unlisten = registeredUnlisten;
+    }).catch((error) => {
+      if (!disposed) markUpdateFailed(error);
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [acceptSnapshot, markUpdateFailed]);
 
   const resizeForDetails = (expanded: boolean) => {
     // 浏览器预览没有 Tauri runtime；只在桌面壳中调整原生窗口尺寸。
@@ -41,7 +73,7 @@ function App() {
   };
 
   return (
-    <PetShell snapshot={snapshot} onExpandedChange={resizeForDetails} />
+    <PetShell snapshot={snapshot} onExpandedChange={resizeForDetails} onRefresh={refresh} />
   );
 }
 

@@ -38,7 +38,7 @@ describe("PetShell", () => {
   it("默认只显示最紧张窗口，点击后展开全部窗口", async () => {
     const onExpandedChange = vi.fn();
     const user = userEvent.setup();
-    render(<PetShell snapshot={snapshot} onExpandedChange={onExpandedChange} />);
+    render(<PetShell snapshot={snapshot} onExpandedChange={onExpandedChange} onRefresh={() => undefined} />);
 
     expect(screen.getByText("36%")).toBeInTheDocument();
     expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
@@ -52,7 +52,7 @@ describe("PetShell", () => {
   it("鼠标离开后延迟收起详情", async () => {
     const onExpandedChange = vi.fn();
     const { container } = render(
-      <PetShell snapshot={snapshot} onExpandedChange={onExpandedChange} />,
+      <PetShell snapshot={snapshot} onExpandedChange={onExpandedChange} onRefresh={() => undefined} />,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "展开额度详情" }));
@@ -68,10 +68,28 @@ describe("PetShell", () => {
       <PetShell
         snapshot={{ ...snapshot, availability: "unavailable", windows: [] }}
         onExpandedChange={() => undefined}
+        onRefresh={() => undefined}
       />,
     );
 
     expect(screen.getByText("额度暂不可用")).toBeInTheDocument();
     expect(screen.queryByText("0%")).not.toBeInTheDocument();
+  });
+
+  it("展开后可手动刷新额度", async () => {
+    const onRefresh = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <PetShell
+        snapshot={snapshot}
+        onExpandedChange={() => undefined}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "展开额度详情" }));
+    await user.click(screen.getByRole("button", { name: "刷新额度" }));
+
+    expect(onRefresh).toHaveBeenCalledTimes(1);
   });
 });

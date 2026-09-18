@@ -37,4 +37,8 @@ button { font: inherit; }
 .empty-state { display: grid; place-content: center; min-height: 148px; text-align: center; }
 .empty-state strong { color: #d3dae3; font-size: 15px; }
 .empty-state span { margin-top: 5px; color: #7f909d; font-size: 11px; }
+.quota-actions { position: absolute; left: 20px; bottom: 12px; }
+.quota-actions button { padding: 4px 9px; border: 1px solid rgba(141, 241, 204, .24); border-radius: 99px; color: #bbf5df; background: rgba(55, 187, 143, .1); font-size: 10px; cursor: pointer; }
+.quota-actions button:hover { background: rgba(55, 187, 143, .2); }
+.quota-actions button:focus-visible { outline: 2px solid #72e9c0; outline-offset: 2px; }
 .quota-card footer { position: absolute; right: 20px; bottom: 15px; color: #667882; font-size: 9px; }

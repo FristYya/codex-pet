@@ -57,9 +57,9 @@ pnpm test --run
 
 ## 额度读取方式
 
-程序会直接启动 `codex app-server --stdio`，完成初始化握手后调用 `account/rateLimits/read`。它不会启动模型回合，也不会发送提示词。
+程序会直接启动 `codex app-server --stdio`，完成初始化握手后调用 `account/rateLimits/read`。额度变化通知只作为刷新信号，经 800ms 防抖后重新读取完整额度，并通过 Tauri 事件即时更新桌宠；60 秒轮询仍作为对账兜底。它不会启动模型回合，也不会发送提示词。
 
-Rust 适配器已识别 `account/rateLimits/updated` 和 `account/updated` 通知；当前 UI 先通过 60 秒完整刷新确保数据稳定，事件驱动刷新将在下一次联调中接入。
+Rust 适配器已识别 `account/rateLimits/updated` 和 `account/updated` 通知；`account/rateLimits/updated` 会触发完整额度读取，稀疏通知内容不会直接进入 UI。
 
 正式运行要求 Codex CLI 已安装并使用 ChatGPT 账号登录。桌宠不会读取 `auth.json`、Token、Cookie 或会话文件。
 

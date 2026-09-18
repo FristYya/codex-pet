@@ -4,6 +4,7 @@ import type { QuotaSnapshot } from "../quota/types";
 type PetShellProps = {
   snapshot: QuotaSnapshot;
   onExpandedChange: (expanded: boolean) => void;
+  onRefresh: () => void;
 };
 
 const AUTO_COLLAPSE_MS = 800;
@@ -35,7 +36,7 @@ function resetLabel(resetsAt: number | null) {
   return `重置于 ${remainder}M`;
 }
 
-export function PetShell({ snapshot, onExpandedChange }: PetShellProps) {
+export function PetShell({ snapshot, onExpandedChange, onRefresh }: PetShellProps) {
   const [expanded, setExpanded] = useState(false);
   const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tightestWindow = useMemo(() => [...snapshot.windows].sort((a, b) => a.remainingPercent - b.remainingPercent)[0], [snapshot.windows]);
@@ -62,6 +63,9 @@ export function PetShell({ snapshot, onExpandedChange }: PetShellProps) {
           <div className="quota-track" aria-hidden="true"><span style={{ width: `${window.remainingPercent}%` }} /></div>
           <small>{resetLabel(window.resetsAt)}</small>
         </article>)}</div> : <div className="empty-state"><strong>{snapshot.message ?? "额度暂不可用"}</strong><span>请确认 Codex CLI 已登录</span></div>}
+        <div className="quota-actions">
+          <button type="button" onClick={onRefresh}>刷新额度</button>
+        </div>
         <footer>{snapshot.planType ? `${snapshot.planType} 方案` : "等待本机 Codex"}</footer>
       </section>}
     </main>
