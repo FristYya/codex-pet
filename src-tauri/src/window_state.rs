@@ -54,6 +54,24 @@ pub fn resolve_startup_monitor(provider: &impl MonitorProvider) -> Option<Monito
         })
 }
 
+pub fn resolve_startup_monitor_for(
+    provider: &impl MonitorProvider,
+    saved_window: &SavedWindow,
+) -> Option<MonitorContext> {
+    let saved_key = saved_window.monitor_key.as_deref();
+    let saved_name = saved_window.monitor_name.as_deref();
+    if (saved_key.is_some() || saved_name.is_some())
+        && let Ok(monitors) = provider.available_monitors()
+        && let Some(monitor) = monitors.into_iter().find(|monitor| {
+            let name = monitor.name.as_deref();
+            saved_key == name || saved_name == name
+        })
+    {
+        return Some(monitor);
+    }
+    resolve_startup_monitor(provider)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WindowMode {
     Collapsed,
@@ -304,6 +322,34 @@ mod tests {
         };
 
         assert_eq!(resolve_startup_monitor(&provider), Some(primary));
+    }
+
+    #[test]
+    fn startup_resolver_restores_the_saved_monitor_before_falling_back_to_primary() {
+        let primary = MonitorContext::new(
+            Some("primary".into()),
+            PhysicalRect::new(0.0, 0.0, 1920.0, 1040.0),
+            1.0,
+        );
+        let saved = MonitorContext::new(
+            Some("secondary".into()),
+            PhysicalRect::new(-1920.0, 0.0, 1920.0, 1040.0),
+            1.25,
+        );
+        let provider = FakeMonitors {
+            current: Ok(None),
+            primary: Ok(Some(primary)),
+            available: Ok(vec![saved.clone()]),
+        };
+        let saved_window = SavedWindow {
+            monitor_key: Some("secondary".into()),
+            ..UiSettings::default().window
+        };
+
+        assert_eq!(
+            resolve_startup_monitor_for(&provider, &saved_window),
+            Some(saved)
+        );
     }
 
     #[test]

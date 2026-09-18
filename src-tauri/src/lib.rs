@@ -12,7 +12,7 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 use window_state::{
-    MonitorContext, MonitorProvider, RuntimeWindowState, resolve_monitor, resolve_startup_monitor,
+    MonitorContext, MonitorProvider, RuntimeWindowState, resolve_monitor, resolve_startup_monitor_for,
 };
 
 pub mod codex_adapter;
@@ -317,7 +317,10 @@ pub fn run() {
             let window = app
                 .get_webview_window("main")
                 .ok_or_else(|| std::io::Error::other("missing main window"))?;
-            let monitor = resolve_startup_monitor(&TauriWebviewMonitorProvider { window: &window });
+            let monitor = resolve_startup_monitor_for(
+                &TauriWebviewMonitorProvider { window: &window },
+                &loaded.settings.window,
+            );
             let initial_rect = monitor
                 .as_ref()
                 .map(|monitor| settings::initial_collapsed_rect(
