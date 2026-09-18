@@ -26,6 +26,7 @@ auth.json
 coverage
 .cache
 .superpowers
+.worktrees/
 
 # Editor directories and files
 .vscode/*
