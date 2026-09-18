@@ -424,6 +424,26 @@ mod tests {
     }
 
     #[test]
+    fn move_after_a_scale_change_saves_the_new_monitor_scale_and_relative_offset() {
+        let monitor = MonitorContext::new(
+            Some("secondary".into()),
+            PhysicalRect::new(-1920.0, 40.0, 1920.0, 1040.0),
+            1.5,
+        );
+        let mut coordinator =
+            WindowStateCoordinator::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+
+        assert_eq!(
+            coordinator.handle_moved_position(-1770, 160, Some(&monitor)),
+            MoveAction::SchedulePersist
+        );
+        assert_eq!(coordinator.collapsed().x, 100.0);
+        assert_eq!(coordinator.collapsed().y, 80.0);
+        assert_eq!(coordinator.collapsed().scale_factor, 1.5);
+        assert_eq!(coordinator.collapsed().monitor_key.as_deref(), Some("secondary"));
+    }
+
+    #[test]
     fn runtime_state_returns_a_persisted_snapshot_only_for_user_collapsed_moves() {
         let monitor = MonitorContext::new(None, PhysicalRect::new(0.0, 0.0, 1920.0, 1040.0), 1.0);
         let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));

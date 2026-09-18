@@ -633,6 +633,27 @@ mod tests {
     }
 
     #[test]
+    fn restoration_uses_the_target_dpi_after_saved_display_dpi_changes() {
+        let work_area = PhysicalRect::new(-1920.0, 40.0, 1920.0, 1040.0);
+        let saved = SavedWindow {
+            x: 100.0,
+            y: 80.0,
+            scale_factor: 1.25,
+            ..UiSettings::default().window
+        };
+
+        assert_eq!(
+            restore_collapsed_rect(&saved, work_area, 1.5),
+            PhysicalRect::new(-1770.0, 160.0, 246.0, 231.0)
+        );
+        let saved_at_150 = SavedWindow { scale_factor: 1.5, ..saved };
+        assert_eq!(
+            restore_collapsed_rect(&saved_at_150, work_area, 1.0),
+            PhysicalRect::new(-1820.0, 120.0, 164.0, 154.0)
+        );
+    }
+
+    #[test]
     fn default_position_uses_work_area_bottom_right_with_physical_margin() {
         let work_area = PhysicalRect::new(-1920.0, 40.0, 1920.0, 1040.0);
 
