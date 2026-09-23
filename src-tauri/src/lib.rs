@@ -2,18 +2,26 @@ use codex_adapter::{AdapterError, CodexClient, ServerNotification};
 use quota::{QuotaRefreshCoordinator, QuotaSnapshot, spawn_notification_bridge};
 use serde_json::Value;
 use std::{
-    sync::{Arc, Mutex, mpsc::{Receiver, Sender, channel}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender, channel},
+    },
     thread,
     time::Duration,
 };
 use tauri::{
     Emitter, Manager,
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
 };
 use window_state::{
-    MonitorContext, MonitorProvider, RuntimeWindowState, resolve_monitor, resolve_startup_monitor_for,
+    LOCKED_MENU_ID, MonitorContext, MonitorProvider, NativeWindow, RuntimeWindowState,
+    TOPMOST_MENU_ID, TrayState, WindowOperationError, WindowOperationResult, WindowStateController,
+    resolve_monitor, resolve_startup_monitor_for,
 };
+
+const WINDOW_LOCKED_EVENT: &str = "window://locked";
 
 pub mod codex_adapter;
 pub mod quota;
@@ -83,18 +91,101 @@ impl<R: tauri::Runtime> MonitorProvider for TauriWebviewMonitorProvider<'_, R> {
     }
 }
 
+impl<R: tauri::Runtime> NativeWindow for tauri::Window<R> {
+    fn show_without_activation(&self) -> WindowOperationResult {
+        // Keep Tauri/Tao's visibility state synchronized with the HWND. Tao's
+        // Windows implementation applies visibility without activation; calling
+        // `set_focus` here would be the only explicit focus request.
+        tauri::Window::show(self).map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn hide(&self) -> WindowOperationResult {
+        tauri::Window::hide(self).map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn set_always_on_top(&self, enabled: bool) -> WindowOperationResult {
+        tauri::Window::set_always_on_top(self, enabled)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn set_ignore_cursor_events(&self, enabled: bool) -> WindowOperationResult {
+        tauri::Window::set_ignore_cursor_events(self, enabled)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+}
+
+impl<R: tauri::Runtime> NativeWindow for tauri::WebviewWindow<R> {
+    fn show_without_activation(&self) -> WindowOperationResult {
+        // See `Window` above: use Tauri's dispatcher so later hide/cursor
+        // operations observe the same visibility state as the native HWND.
+        tauri::WebviewWindow::show(self).map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn hide(&self) -> WindowOperationResult {
+        tauri::WebviewWindow::hide(self)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn set_always_on_top(&self, enabled: bool) -> WindowOperationResult {
+        tauri::WebviewWindow::set_always_on_top(self, enabled)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn set_ignore_cursor_events(&self, enabled: bool) -> WindowOperationResult {
+        tauri::WebviewWindow::set_ignore_cursor_events(self, enabled)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+}
+
+struct TauriTrayState<R: tauri::Runtime> {
+    locked: CheckMenuItem<R>,
+    topmost: CheckMenuItem<R>,
+}
+
+impl<R: tauri::Runtime> Clone for TauriTrayState<R> {
+    fn clone(&self) -> Self {
+        Self {
+            locked: self.locked.clone(),
+            topmost: self.topmost.clone(),
+        }
+    }
+}
+
+impl<R: tauri::Runtime> TauriTrayState<R> {
+    fn item(&self, id: &str) -> WindowOperationResult<&CheckMenuItem<R>> {
+        match id {
+            LOCKED_MENU_ID => Ok(&self.locked),
+            TOPMOST_MENU_ID => Ok(&self.topmost),
+            _ => Err(WindowOperationError::new(format!(
+                "unknown checkbox menu id: {id}"
+            ))),
+        }
+    }
+}
+
+impl<R: tauri::Runtime> TrayState for TauriTrayState<R> {
+    fn is_checked(&self, id: &str) -> WindowOperationResult<bool> {
+        self.item(id)?
+            .is_checked()
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn set_checked(&self, id: &str, checked: bool) -> WindowOperationResult {
+        self.item(id)?
+            .set_checked(checked)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+}
+
 struct WindowPersistenceState {
     runtime: Mutex<RuntimeWindowState>,
     writer: Option<Arc<Mutex<settings::DebouncedSettingsWriter<settings::WindowsReplace>>>>,
     scheduler: Mutex<Option<Sender<u64>>>,
+    tray_ready: AtomicBool,
 }
 
 impl WindowPersistenceState {
-    fn new(
-        runtime: RuntimeWindowState,
-        target: std::path::PathBuf,
-        writable: bool,
-    ) -> Self {
+    fn new(runtime: RuntimeWindowState, target: std::path::PathBuf, writable: bool) -> Self {
         let writer = writable.then(|| {
             Arc::new(Mutex::new(settings::DebouncedSettingsWriter::new(
                 settings::WindowsReplace,
@@ -110,7 +201,100 @@ impl WindowPersistenceState {
             runtime: Mutex::new(runtime),
             writer,
             scheduler: Mutex::new(scheduler),
+            tray_ready: AtomicBool::new(false),
         }
+    }
+
+    fn transition<T>(
+        &self,
+        transition: impl FnOnce(&mut RuntimeWindowState) -> WindowOperationResult<T>,
+    ) -> WindowOperationResult<T> {
+        let (result, changed) = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| WindowOperationError::new("window state mutex poisoned"))?;
+            let before = runtime.persisted_settings().clone();
+            let result = transition(&mut runtime);
+            let after = runtime.persisted_settings().clone();
+            (result, (before != after).then_some(after))
+        };
+        if let Some(snapshot) = changed {
+            self.schedule(snapshot);
+        }
+        result
+    }
+
+    fn set_visible(
+        &self,
+        window: &impl NativeWindow,
+        visible: bool,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| WindowStateController::new(runtime).set_visible(window, visible))
+    }
+
+    fn set_locked_from_tray(
+        &self,
+        window: &impl NativeWindow,
+        tray: &impl TrayState,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| {
+            WindowStateController::new(runtime).set_locked_from_tray(window, tray)
+        })
+    }
+
+    fn set_always_on_top_from_tray(
+        &self,
+        window: &impl NativeWindow,
+        tray: &impl TrayState,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| {
+            WindowStateController::new(runtime).set_always_on_top_from_tray(window, tray)
+        })
+    }
+
+    fn restore_locked<W: NativeWindow, T: TrayState>(
+        &self,
+        window: &W,
+        tray: Option<&T>,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| WindowStateController::new(runtime).restore_locked(window, tray))
+    }
+
+    fn restore_always_on_top(
+        &self,
+        window: &impl NativeWindow,
+        tray: &impl TrayState,
+        always_on_top: bool,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| {
+            WindowStateController::new(runtime).set_always_on_top(window, tray, always_on_top)
+        })
+    }
+
+    fn force_unlocked(
+        &self,
+        window: &impl NativeWindow,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| WindowStateController::new(runtime).force_unlocked(window))
+    }
+
+    fn close_requested(
+        &self,
+        window: &impl NativeWindow,
+        prevent_close: impl FnOnce(),
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| {
+            WindowStateController::new(runtime).close_requested(window, prevent_close)
+        })
+    }
+
+    fn mark_tray_ready(&self) {
+        self.tray_ready.store(true, Ordering::Release);
+    }
+
+    fn is_tray_ready(&self) -> bool {
+        self.tray_ready.load(Ordering::Acquire)
     }
 
     fn schedule(&self, snapshot: settings::UiSettings) {
@@ -293,6 +477,26 @@ fn read_quota(state: tauri::State<'_, AppState>) -> QuotaSnapshot {
     state.coordinator.refresh()
 }
 
+#[tauri::command]
+fn read_window_locked(state: tauri::State<'_, WindowPersistenceState>) -> Result<bool, String> {
+    state
+        .runtime
+        .lock()
+        .map(|runtime| runtime.persisted_settings().locked)
+        .map_err(|_| "window state mutex poisoned".to_string())
+}
+
+fn handle_window_operation_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    context: &str,
+    error: WindowOperationError,
+) {
+    eprintln!("{context}: {error}");
+    if error.requires_shutdown() {
+        app.exit(1);
+    }
+}
+
 fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::RunEvent) {
     if matches!(event, tauri::RunEvent::Exit)
         && let Some(state) = app.try_state::<WindowPersistenceState>()
@@ -307,7 +511,7 @@ fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![read_quota])
+        .invoke_handler(tauri::generate_handler![read_quota, read_window_locked])
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let settings_dir = app.path().app_config_dir()?;
@@ -323,11 +527,13 @@ pub fn run() {
             );
             let initial_rect = monitor
                 .as_ref()
-                .map(|monitor| settings::initial_collapsed_rect(
-                    &loaded,
-                    monitor.work_area,
-                    monitor.scale_factor,
-                ))
+                .map(|monitor| {
+                    settings::initial_collapsed_rect(
+                        &loaded,
+                        monitor.work_area,
+                        monitor.scale_factor,
+                    )
+                })
                 .unwrap_or(settings::PhysicalRect::new(
                     0.0,
                     0.0,
@@ -335,6 +541,9 @@ pub fn run() {
                     settings::CURRENT_COLLAPSED_HEIGHT,
                 ));
             let saved_before_restore = loaded.settings.clone();
+            let saved_locked = loaded.settings.locked;
+            let saved_topmost = loaded.settings.always_on_top;
+            let saved_visible = loaded.settings.visible;
             let writable_settings = loaded.may_overwrite_source;
             let mut runtime = RuntimeWindowState::from_restored_settings(
                 initial_rect,
@@ -344,10 +553,12 @@ pub fn run() {
             runtime
                 .coordinator_mut()
                 .expect_programmatic_move(initial_rect);
-            let persist_startup_state = writable_settings
-                && runtime.persisted_settings() != &saved_before_restore;
-            let startup_snapshot = persist_startup_state.then(|| runtime.persisted_settings().clone());
-            let persistence = WindowPersistenceState::new(runtime, settings_path, writable_settings);
+            let persist_startup_state =
+                writable_settings && runtime.persisted_settings() != &saved_before_restore;
+            let startup_snapshot =
+                persist_startup_state.then(|| runtime.persisted_settings().clone());
+            let persistence =
+                WindowPersistenceState::new(runtime, settings_path, writable_settings);
             if let Some(snapshot) = startup_snapshot {
                 persistence.schedule(snapshot);
             }
@@ -363,38 +574,144 @@ pub fn run() {
                     let _ = handle.emit(event, snapshot);
                 },
             ));
-            let show = MenuItem::with_id(app, "show", "显示 Codex Pet", true, None::<&str>)?;
-            let hide = MenuItem::with_id(app, "hide", "隐藏", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+            let tray_result = (|| {
+                let show = MenuItem::with_id(app, "show", "显示 Codex Pet", true, None::<&str>)?;
+                let hide = MenuItem::with_id(app, "hide", "隐藏", true, None::<&str>)?;
+                let locked = CheckMenuItem::with_id(
+                    app,
+                    LOCKED_MENU_ID,
+                    "锁定位置",
+                    true,
+                    saved_locked,
+                    None::<&str>,
+                )?;
+                let topmost = CheckMenuItem::with_id(
+                    app,
+                    TOPMOST_MENU_ID,
+                    "始终置顶",
+                    true,
+                    saved_topmost,
+                    None::<&str>,
+                )?;
+                let refresh = MenuItem::with_id(app, "refresh", "刷新额度", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+                let menu =
+                    Menu::with_items(app, &[&show, &hide, &locked, &topmost, &refresh, &quit])?;
+                let tray = TauriTrayState { locked, topmost };
+                let tray_for_event = tray.clone();
 
-            TrayIconBuilder::new()
-                .icon(
-                    app.default_window_icon()
-                        .expect("应用图标应在 Tauri 配置中提供")
-                        .clone(),
-                )
-                .tooltip("Codex Pet")
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                TrayIconBuilder::new()
+                    .icon(
+                        app.default_window_icon()
+                            .expect("应用图标应在 Tauri 配置中提供")
+                            .clone(),
+                    )
+                    .tooltip("Codex Pet")
+                    .menu(&menu)
+                    .on_menu_event(move |app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let (Some(window), Some(state)) = (
+                                app.get_webview_window("main"),
+                                app.try_state::<WindowPersistenceState>(),
+                            ) && let Err(error) = state.set_visible(&window, true)
+                            {
+                                handle_window_operation_error(app, "window show failed", error);
+                            }
+                        }
+                        "hide" => {
+                            if let (Some(window), Some(state)) = (
+                                app.get_webview_window("main"),
+                                app.try_state::<WindowPersistenceState>(),
+                            ) && let Err(error) = state.set_visible(&window, false)
+                            {
+                                handle_window_operation_error(app, "window hide failed", error);
+                            }
+                        }
+                        LOCKED_MENU_ID => {
+                            if let (Some(window), Some(state)) = (
+                                app.get_webview_window("main"),
+                                app.try_state::<WindowPersistenceState>(),
+                            ) {
+                                match state.set_locked_from_tray(&window, &tray_for_event) {
+                                    Ok(settings) => {
+                                        let _ = app.emit(WINDOW_LOCKED_EVENT, settings.locked);
+                                    }
+                                    Err(error) => {
+                                        handle_window_operation_error(
+                                            app,
+                                            "window lock transition failed",
+                                            error,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        TOPMOST_MENU_ID => {
+                            if let (Some(window), Some(state)) = (
+                                app.get_webview_window("main"),
+                                app.try_state::<WindowPersistenceState>(),
+                            ) && let Err(error) =
+                                state.set_always_on_top_from_tray(&window, &tray_for_event)
+                            {
+                                handle_window_operation_error(
+                                    app,
+                                    "window topmost transition failed",
+                                    error,
+                                );
+                            }
+                        }
+                        "refresh" => {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                state.coordinator.refresh();
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .build(app)?;
+
+                Ok::<_, tauri::Error>(tray)
+            })();
+
+            let persistence = app.state::<WindowPersistenceState>();
+            match tray_result {
+                Ok(tray) => {
+                    persistence.mark_tray_ready();
+                    if let Err(error) =
+                        persistence.restore_always_on_top(&window, &tray, saved_topmost)
+                    {
+                        eprintln!("window topmost restore failed: {error}");
+                        if error.requires_shutdown() {
+                            return Err(Box::new(error));
                         }
                     }
-                    "hide" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.hide();
+                    match persistence.restore_locked(&window, Some(&tray)) {
+                        Ok(settings) => {
+                            let _ = app.emit(WINDOW_LOCKED_EVENT, settings.locked);
+                        }
+                        Err(error) => {
+                            eprintln!("window lock restore failed: {error}");
+                            if error.requires_shutdown() {
+                                return Err(Box::new(error));
+                            }
+                            let _ = app.emit(WINDOW_LOCKED_EVENT, false);
                         }
                     }
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
-
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
+                    if let Err(error) = persistence.set_visible(&window, saved_visible) {
+                        eprintln!("window visibility restore failed: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("tray initialization failed; keeping the window unlocked: {error}");
+                    if let Err(unlock_error) = persistence.force_unlocked(&window) {
+                        eprintln!("window unlock fallback failed: {unlock_error}");
+                        return Err(Box::new(unlock_error));
+                    }
+                    if let Err(show_error) = persistence.set_visible(&window, true) {
+                        eprintln!("window show fallback failed: {show_error}");
+                        return Err(Box::new(show_error));
+                    }
+                }
             }
 
             Ok(())
@@ -406,8 +723,14 @@ pub fn run() {
                 }
             }
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _ = window.hide();
+                if let Some(state) = window.app_handle().try_state::<WindowPersistenceState>() {
+                    if !state.is_tray_ready() {
+                        return;
+                    }
+                    if let Err(error) = state.close_requested(window, || api.prevent_close()) {
+                        eprintln!("window close-to-tray failed: {error}");
+                    }
+                }
             }
             _ => {}
         })

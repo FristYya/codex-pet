@@ -1,13 +1,24 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { QuotaSnapshot } from "../quota/types";
 
 type PetShellProps = {
   snapshot: QuotaSnapshot;
+  locked?: boolean;
   onExpandedChange: (expanded: boolean) => void;
+  onStartDragging?: () => void;
   onRefresh: () => void;
 };
 
 const AUTO_COLLAPSE_MS = 800;
+const DRAG_HOLD_MS = 250;
+const DRAG_DISTANCE_PX = 6;
+
+type DragGesture = {
+  pointerId: number;
+  x: number;
+  y: number;
+  dragged: boolean;
+};
 
 function PetFace({ availability }: Pick<QuotaSnapshot, "availability">) {
   const offline = availability === "unavailable" || availability === "unknown";
@@ -36,12 +47,74 @@ function resetLabel(resetsAt: number | null) {
   return `重置于 ${remainder}M`;
 }
 
-export function PetShell({ snapshot, onExpandedChange, onRefresh }: PetShellProps) {
+export function PetShell({ snapshot, locked = false, onExpandedChange, onStartDragging, onRefresh }: PetShellProps) {
   const [expanded, setExpanded] = useState(false);
   const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dragTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gesture = useRef<DragGesture | null>(null);
+  const suppressNextBodyClick = useRef(false);
+  const suppressClickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tightestWindow = useMemo(() => [...snapshot.windows].sort((a, b) => a.remainingPercent - b.remainingPercent)[0], [snapshot.windows]);
 
-  useEffect(() => () => { if (collapseTimer.current) clearTimeout(collapseTimer.current); }, []);
+  const clearGesture = () => {
+    if (dragTimer.current) clearTimeout(dragTimer.current);
+    dragTimer.current = null;
+    gesture.current = null;
+  };
+  const triggerDrag = () => {
+    const activeGesture = gesture.current;
+    if (!activeGesture || activeGesture.dragged) return;
+
+    activeGesture.dragged = true;
+    if (dragTimer.current) clearTimeout(dragTimer.current);
+    dragTimer.current = null;
+    onStartDragging?.();
+  };
+  const beginGesture = (event: ReactPointerEvent<HTMLElement>) => {
+    if (locked || event.button !== 0) return;
+
+    clearGesture();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    gesture.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      dragged: false,
+    };
+    dragTimer.current = setTimeout(triggerDrag, DRAG_HOLD_MS);
+  };
+  const moveGesture = (event: ReactPointerEvent<HTMLElement>) => {
+    const activeGesture = gesture.current;
+    if (!activeGesture || activeGesture.pointerId !== event.pointerId || activeGesture.dragged) return;
+
+    if (Math.hypot(event.clientX - activeGesture.x, event.clientY - activeGesture.y) > DRAG_DISTANCE_PX) {
+      triggerDrag();
+    }
+  };
+  const endGesture = (event: ReactPointerEvent<HTMLElement>, bodyGesture: boolean) => {
+    const activeGesture = gesture.current;
+    if (!activeGesture || activeGesture.pointerId !== event.pointerId) return;
+
+    const dragged = activeGesture.dragged;
+    clearGesture();
+    if (dragged && bodyGesture) {
+      suppressNextBodyClick.current = true;
+      if (suppressClickTimer.current) clearTimeout(suppressClickTimer.current);
+      suppressClickTimer.current = setTimeout(() => {
+        suppressNextBodyClick.current = false;
+        suppressClickTimer.current = null;
+      }, 0);
+    }
+  };
+
+  useEffect(() => () => {
+    if (collapseTimer.current) clearTimeout(collapseTimer.current);
+    clearGesture();
+    if (suppressClickTimer.current) clearTimeout(suppressClickTimer.current);
+  }, []);
+  useEffect(() => {
+    if (locked) clearGesture();
+  }, [locked]);
   const changeExpanded = (next: boolean) => { setExpanded(next); onExpandedChange(next); };
   const scheduleCollapse = () => {
     collapseTimer.current = setTimeout(() => changeExpanded(false), AUTO_COLLAPSE_MS);
@@ -50,9 +123,34 @@ export function PetShell({ snapshot, onExpandedChange, onRefresh }: PetShellProp
   const headline = tightestWindow ? `${Math.round(tightestWindow.remainingPercent)}%` : snapshot.availability === "blocked" ? "已暂停" : "额度暂不可用";
 
   return (
-    <main className={`pet-shell pet-${snapshot.availability}${expanded ? " is-expanded" : ""}`} onPointerEnter={cancelCollapse} onPointerLeave={scheduleCollapse}>
-      <div className="drag-handle" data-tauri-drag-region aria-label="拖动桌宠" />
-      <button type="button" className="pet-button" aria-label={expanded ? "收起额度详情" : "展开额度详情"} aria-expanded={expanded} onClick={() => changeExpanded(!expanded)}>
+    <main className={`pet-shell pet-${snapshot.availability}${expanded ? " is-expanded" : ""}${locked ? " is-locked" : ""}`} onPointerEnter={cancelCollapse} onPointerLeave={scheduleCollapse}>
+      <div
+        className="drag-handle"
+        aria-label="拖动桌宠"
+        aria-disabled={locked || undefined}
+        onPointerDown={beginGesture}
+        onPointerMove={moveGesture}
+        onPointerUp={(event) => endGesture(event, false)}
+        onPointerCancel={clearGesture}
+      />
+      <button
+        type="button"
+        className="pet-button"
+        aria-label={expanded ? "收起额度详情" : "展开额度详情"}
+        aria-expanded={expanded}
+        onPointerDown={beginGesture}
+        onPointerMove={moveGesture}
+        onPointerUp={(event) => endGesture(event, true)}
+        onPointerCancel={clearGesture}
+        onClick={() => {
+          if (locked) return;
+          if (suppressNextBodyClick.current) {
+            suppressNextBodyClick.current = false;
+            return;
+          }
+          changeExpanded(!expanded);
+        }}
+      >
         <PetFace availability={snapshot.availability} />
         <span className="quota-pill">{headline}</span>
       </button>

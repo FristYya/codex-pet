@@ -18,6 +18,7 @@ const initialSnapshot: QuotaSnapshot = {
 
 function App() {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot>(initialSnapshot);
+  const [locked, setLocked] = useState(false);
   const hasSuccessfulSnapshot = useRef(false);
   const acceptSnapshot = useCallback((nextSnapshot: QuotaSnapshot) => {
     hasSuccessfulSnapshot.current = true;
@@ -64,6 +65,29 @@ function App() {
     };
   }, [acceptSnapshot, markUpdateFailed]);
 
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+
+    let disposed = false;
+    let eventReceived = false;
+    let unlisten: (() => void) | undefined;
+    void listen<boolean>("window://locked", (event) => {
+      eventReceived = true;
+      if (!disposed) setLocked(event.payload);
+    }).then((registeredUnlisten) => {
+      if (disposed) registeredUnlisten();
+      else unlisten = registeredUnlisten;
+    }).catch(() => undefined);
+    void invoke<boolean>("read_window_locked").then((initialLocked) => {
+      if (!disposed && !eventReceived) setLocked(initialLocked);
+    }).catch(() => undefined);
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const resizeForDetails = (expanded: boolean) => {
     // 浏览器预览没有 Tauri runtime；只在桌面壳中调整原生窗口尺寸。
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -72,8 +96,19 @@ function App() {
     );
   };
 
+  const startDragging = useCallback(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    void getCurrentWindow().startDragging();
+  }, []);
+
   return (
-    <PetShell snapshot={snapshot} onExpandedChange={resizeForDetails} onRefresh={refresh} />
+    <PetShell
+      snapshot={snapshot}
+      locked={locked}
+      onExpandedChange={resizeForDetails}
+      onStartDragging={startDragging}
+      onRefresh={refresh}
+    />
   );
 }
 

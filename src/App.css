@@ -4,6 +4,7 @@ html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; back
 button { font: inherit; }
 .pet-shell { position: relative; width: 100%; height: 100%; display: flex; align-items: center; flex-direction: column; padding: 7px; user-select: none; }
 .drag-handle { width: 38px; height: 6px; border-radius: 99px; background: rgba(111, 245, 199, .55); cursor: grab; margin-bottom: -3px; z-index: 3; }
+.is-locked .drag-handle { opacity: .35; cursor: default; pointer-events: none; }
 .pet-button { position: relative; width: 142px; height: 132px; padding: 4px 10px 22px; border: 0; border-radius: 42px; color: inherit; background: radial-gradient(circle at 50% 32%, rgba(47, 82, 79, .6), rgba(8, 20, 26, .88)); box-shadow: 0 12px 28px rgba(0, 0, 0, .38), inset 0 0 0 1px rgba(176, 255, 226, .2); cursor: pointer; transition: transform .18s ease, filter .18s ease; }
 .pet-button:hover { transform: translateY(-2px); filter: brightness(1.08); }
 .pet-button:focus-visible { outline: 2px solid #72e9c0; outline-offset: 2px; }
