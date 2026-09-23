@@ -15,10 +15,11 @@ use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_autostart::{AutoLaunchManager, ManagerExt as AutostartManagerExt};
 use window_state::{
-    LOCKED_MENU_ID, MonitorContext, MonitorProvider, NativeWindow, RuntimeWindowState,
-    TOPMOST_MENU_ID, TrayState, WindowOperationError, WindowOperationResult, WindowStateController,
-    resolve_monitor, resolve_startup_monitor_for,
+    AUTOSTART_MENU_ID, AutostartControl, LOCKED_MENU_ID, MonitorContext, MonitorProvider,
+    NativeWindow, RuntimeWindowState, TOPMOST_MENU_ID, TrayState, WindowOperationError,
+    WindowOperationResult, WindowStateController, resolve_monitor, resolve_startup_monitor_for,
 };
 
 const WINDOW_LOCKED_EVENT: &str = "window://locked";
@@ -118,7 +119,8 @@ impl<R: tauri::Runtime> NativeWindow for tauri::WebviewWindow<R> {
     fn show_without_activation(&self) -> WindowOperationResult {
         // See `Window` above: use Tauri's dispatcher so later hide/cursor
         // operations observe the same visibility state as the native HWND.
-        tauri::WebviewWindow::show(self).map_err(|error| WindowOperationError::new(error.to_string()))
+        tauri::WebviewWindow::show(self)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
     }
 
     fn hide(&self) -> WindowOperationResult {
@@ -140,6 +142,7 @@ impl<R: tauri::Runtime> NativeWindow for tauri::WebviewWindow<R> {
 struct TauriTrayState<R: tauri::Runtime> {
     locked: CheckMenuItem<R>,
     topmost: CheckMenuItem<R>,
+    autostart: CheckMenuItem<R>,
 }
 
 impl<R: tauri::Runtime> Clone for TauriTrayState<R> {
@@ -147,6 +150,7 @@ impl<R: tauri::Runtime> Clone for TauriTrayState<R> {
         Self {
             locked: self.locked.clone(),
             topmost: self.topmost.clone(),
+            autostart: self.autostart.clone(),
         }
     }
 }
@@ -156,6 +160,7 @@ impl<R: tauri::Runtime> TauriTrayState<R> {
         match id {
             LOCKED_MENU_ID => Ok(&self.locked),
             TOPMOST_MENU_ID => Ok(&self.topmost),
+            AUTOSTART_MENU_ID => Ok(&self.autostart),
             _ => Err(WindowOperationError::new(format!(
                 "unknown checkbox menu id: {id}"
             ))),
@@ -173,6 +178,23 @@ impl<R: tauri::Runtime> TrayState for TauriTrayState<R> {
     fn set_checked(&self, id: &str, checked: bool) -> WindowOperationResult {
         self.item(id)?
             .set_checked(checked)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+}
+
+impl AutostartControl for AutoLaunchManager {
+    fn is_enabled(&self) -> WindowOperationResult<bool> {
+        AutoLaunchManager::is_enabled(self)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn enable(&self) -> WindowOperationResult {
+        AutoLaunchManager::enable(self)
+            .map_err(|error| WindowOperationError::new(error.to_string()))
+    }
+
+    fn disable(&self) -> WindowOperationResult {
+        AutoLaunchManager::disable(self)
             .map_err(|error| WindowOperationError::new(error.to_string()))
     }
 }
@@ -250,6 +272,26 @@ impl WindowPersistenceState {
     ) -> WindowOperationResult<settings::UiSettings> {
         self.transition(|runtime| {
             WindowStateController::new(runtime).set_always_on_top_from_tray(window, tray)
+        })
+    }
+
+    fn set_autostart_from_tray(
+        &self,
+        autostart: &impl AutostartControl,
+        tray: &impl TrayState,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| {
+            WindowStateController::new(runtime).set_autostart_from_tray(autostart, tray)
+        })
+    }
+
+    fn reconcile_autostart(
+        &self,
+        autostart: &impl AutostartControl,
+        tray: Option<&impl TrayState>,
+    ) -> WindowOperationResult<settings::UiSettings> {
+        self.transition(|runtime| {
+            WindowStateController::new(runtime).reconcile_autostart(autostart, tray)
         })
     }
 
@@ -513,6 +555,11 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![read_quota, read_window_locked])
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("Codex Pet")
+                .build(),
+        )
         .setup(|app| {
             let settings_dir = app.path().app_config_dir()?;
             std::fs::create_dir_all(&settings_dir)?;
@@ -544,6 +591,7 @@ pub fn run() {
             let saved_locked = loaded.settings.locked;
             let saved_topmost = loaded.settings.always_on_top;
             let saved_visible = loaded.settings.visible;
+            let saved_autostart = loaded.settings.autostart;
             let writable_settings = loaded.may_overwrite_source;
             let mut runtime = RuntimeWindowState::from_restored_settings(
                 initial_rect,
@@ -593,11 +641,25 @@ pub fn run() {
                     saved_topmost,
                     None::<&str>,
                 )?;
+                let autostart = CheckMenuItem::with_id(
+                    app,
+                    AUTOSTART_MENU_ID,
+                    "开机自动启动",
+                    true,
+                    saved_autostart,
+                    None::<&str>,
+                )?;
                 let refresh = MenuItem::with_id(app, "refresh", "刷新额度", true, None::<&str>)?;
                 let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-                let menu =
-                    Menu::with_items(app, &[&show, &hide, &locked, &topmost, &refresh, &quit])?;
-                let tray = TauriTrayState { locked, topmost };
+                let menu = Menu::with_items(
+                    app,
+                    &[&show, &hide, &locked, &topmost, &autostart, &refresh, &quit],
+                )?;
+                let tray = TauriTrayState {
+                    locked,
+                    topmost,
+                    autostart,
+                };
                 let tray_for_event = tray.clone();
 
                 TrayIconBuilder::new()
@@ -660,6 +722,20 @@ pub fn run() {
                                 );
                             }
                         }
+                        AUTOSTART_MENU_ID => {
+                            if let Some(state) = app.try_state::<WindowPersistenceState>() {
+                                let autostart = app.autolaunch();
+                                if let Err(error) =
+                                    state.set_autostart_from_tray(&*autostart, &tray_for_event)
+                                {
+                                    handle_window_operation_error(
+                                        app,
+                                        "autostart transition failed",
+                                        error,
+                                    );
+                                }
+                            }
+                        }
                         "refresh" => {
                             if let Some(state) = app.try_state::<AppState>() {
                                 state.coordinator.refresh();
@@ -674,6 +750,15 @@ pub fn run() {
             })();
 
             let persistence = app.state::<WindowPersistenceState>();
+            let autostart = app.autolaunch();
+            if let Err(error) =
+                persistence.reconcile_autostart(&*autostart, tray_result.as_ref().ok())
+            {
+                eprintln!("autostart state restore failed: {error}");
+                if error.requires_shutdown() {
+                    return Err(Box::new(error));
+                }
+            }
             match tray_result {
                 Ok(tray) => {
                     persistence.mark_tray_ready();

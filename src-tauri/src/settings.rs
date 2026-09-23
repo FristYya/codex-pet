@@ -120,6 +120,7 @@ pub struct UiSettings {
     pub locked: bool,
     pub always_on_top: bool,
     pub visible: bool,
+    #[serde(default)]
     pub autostart: bool,
 }
 
@@ -432,6 +433,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_without_autostart_remain_valid_and_default_to_disabled() {
+        let parsed = parse_settings(
+            r#"{
+              "version": 1,
+              "window": { "x": 100, "y": 80, "width": 164, "height": 154, "scaleFactor": 1 },
+              "locked": false,
+              "alwaysOnTop": true,
+              "visible": true
+            }"#,
+        );
+
+        assert!(parsed.has_valid_source);
+        assert!(parsed.may_overwrite_source);
+        assert!(!parsed.settings.autostart);
+    }
+
+    #[test]
     fn malformed_or_future_settings_fall_back_without_becoming_writable() {
         assert_eq!(parse_settings("not-json").settings, UiSettings::default());
 
@@ -646,7 +664,10 @@ mod tests {
             restore_collapsed_rect(&saved, work_area, 1.5),
             PhysicalRect::new(-1770.0, 160.0, 246.0, 231.0)
         );
-        let saved_at_150 = SavedWindow { scale_factor: 1.5, ..saved };
+        let saved_at_150 = SavedWindow {
+            scale_factor: 1.5,
+            ..saved
+        };
         assert_eq!(
             restore_collapsed_rect(&saved_at_150, work_area, 1.0),
             PhysicalRect::new(-1820.0, 120.0, 164.0, 154.0)

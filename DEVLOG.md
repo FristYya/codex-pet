@@ -1,5 +1,15 @@
 # 开发日志
 
+## 2026-09-23：开机自动启动
+
+- 接入官方 `tauri-plugin-autostart` Rust manager（2.x）；Tray 提供“开机自动启动”勾选项，不增加前端插件，也不直接调用 Windows Registry。
+- 启动时用插件查询的系统实际状态校正 Tray 与设置快照，避免用户通过 Windows 启动应用管理器关闭后又被应用擅自启用。
+- Tray 初始化失败时仍查询并保存原生自动启动状态，避免设置镜像因没有菜单而保持陈旧；窗口按既有安全回退保持可操作。
+- 运行时切换先查询并操作系统启动注册，再同步 Tray；两步成功后更新 `UiSettings.autostart` 并进入现有原子持久化调度。失败补偿恢复原生状态与菜单，补偿失败要求关闭应用。
+- 为旧 `ui-settings.json` 缺少 `autostart` 字段的情况增加默认关闭兼容，不升级 schema 版本。
+- 自动化验证已覆盖启用/关闭、查询/设置/菜单失败补偿、补偿失败、Tray 不可用或同步失败时的启动状态处理和旧配置解析；Rust 85 项、前端 32 项通过，Clippy 与 MSI/NSIS Release 构建通过。
+- Windows 人工验收通过：启用后退出并重开仍勾选，关闭后退出并重开已取消勾选，最终保持关闭。用户观察到 Debug 启动目标为当前 worktree 下的 Debug exe 且 Windows UI 显示为灰色，Release 正常；插件按启用时的 `current_exe` 登记目标，因此开发版的启动目标不同于正式 Release 属预期，最终关闭避免启动调试版。
+
 ## 2026-09-23：锁定、Tray 与拖动手势验收
 
 - 桌宠主体与顶部拖动柄共用 Pointer Events 手势状态；短按保留详情展开/收起，长按 250ms 或移动超过 6px 时只调用一次 Tauri `startDragging()`。

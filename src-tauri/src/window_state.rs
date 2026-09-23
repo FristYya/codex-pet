@@ -6,6 +6,7 @@ use std::{error::Error, fmt};
 
 pub const LOCKED_MENU_ID: &str = "locked";
 pub const TOPMOST_MENU_ID: &str = "topmost";
+pub const AUTOSTART_MENU_ID: &str = "autostart";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowOperationError {
@@ -71,6 +72,12 @@ pub trait NativeWindow {
 pub trait TrayState {
     fn is_checked(&self, id: &str) -> WindowOperationResult<bool>;
     fn set_checked(&self, id: &str, checked: bool) -> WindowOperationResult;
+}
+
+pub trait AutostartControl {
+    fn is_enabled(&self) -> WindowOperationResult<bool>;
+    fn enable(&self) -> WindowOperationResult;
+    fn disable(&self) -> WindowOperationResult;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +218,10 @@ impl RuntimeWindowState {
     }
     pub fn set_always_on_top(&mut self, always_on_top: bool) -> UiSettings {
         self.settings.always_on_top = always_on_top;
+        self.settings.clone()
+    }
+    pub fn set_autostart(&mut self, autostart: bool) -> UiSettings {
+        self.settings.autostart = autostart;
         self.settings.clone()
     }
     pub fn handle_moved(
@@ -416,6 +427,95 @@ impl<'a> WindowStateController<'a> {
         self.set_always_on_top(window, tray, always_on_top)
     }
 
+    pub fn set_autostart(
+        &mut self,
+        autostart: &impl AutostartControl,
+        tray: &impl TrayState,
+        enabled: bool,
+    ) -> WindowOperationResult<UiSettings> {
+        let previous = match autostart.is_enabled() {
+            Ok(previous) => previous,
+            Err(error) => {
+                let failures = tray
+                    .set_checked(AUTOSTART_MENU_ID, self.state.settings.autostart)
+                    .err()
+                    .map(|error| ("restore autostart checkbox", error));
+                return Err(WindowOperationError::after_compensation(error, failures));
+            }
+        };
+
+        let change_result = if enabled {
+            autostart.enable()
+        } else {
+            autostart.disable()
+        };
+        if let Err(error) = change_result {
+            let failures = [
+                if previous {
+                    autostart.enable().err()
+                } else {
+                    autostart.disable().err()
+                }
+                .map(|error| ("restore native autostart", error)),
+                tray.set_checked(AUTOSTART_MENU_ID, previous)
+                    .err()
+                    .map(|error| ("restore autostart checkbox", error)),
+            ]
+            .into_iter()
+            .flatten();
+            return Err(WindowOperationError::after_compensation(error, failures));
+        }
+
+        if let Err(error) = tray.set_checked(AUTOSTART_MENU_ID, enabled) {
+            let failures = [
+                if previous {
+                    autostart.enable().err()
+                } else {
+                    autostart.disable().err()
+                }
+                .map(|error| ("restore native autostart", error)),
+                tray.set_checked(AUTOSTART_MENU_ID, previous)
+                    .err()
+                    .map(|error| ("restore autostart checkbox", error)),
+            ]
+            .into_iter()
+            .flatten();
+            return Err(WindowOperationError::after_compensation(error, failures));
+        }
+
+        Ok(self.state.set_autostart(enabled))
+    }
+
+    pub fn set_autostart_from_tray(
+        &mut self,
+        autostart: &impl AutostartControl,
+        tray: &impl TrayState,
+    ) -> WindowOperationResult<UiSettings> {
+        let enabled = match tray.is_checked(AUTOSTART_MENU_ID) {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                let failures = tray
+                    .set_checked(AUTOSTART_MENU_ID, self.state.settings.autostart)
+                    .err()
+                    .map(|error| ("restore autostart checkbox", error));
+                return Err(WindowOperationError::after_compensation(error, failures));
+            }
+        };
+        self.set_autostart(autostart, tray, enabled)
+    }
+
+    pub fn reconcile_autostart(
+        &mut self,
+        autostart: &impl AutostartControl,
+        tray: Option<&impl TrayState>,
+    ) -> WindowOperationResult<UiSettings> {
+        let enabled = autostart.is_enabled()?;
+        if let Some(tray) = tray {
+            tray.set_checked(AUTOSTART_MENU_ID, enabled)?;
+        }
+        Ok(self.state.set_autostart(enabled))
+    }
+
     pub fn set_visible(
         &mut self,
         window: &impl NativeWindow,
@@ -614,6 +714,46 @@ mod tests {
                 Err(WindowOperationError::new("checkbox write failed"))
             } else {
                 self.checked.borrow_mut().insert(id.into(), checked);
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeAutostart {
+        enabled: Cell<bool>,
+        calls: RefCell<Vec<&'static str>>,
+        fail_query: Cell<bool>,
+        fail_enable: Cell<bool>,
+        fail_disable: Cell<bool>,
+    }
+
+    impl AutostartControl for FakeAutostart {
+        fn is_enabled(&self) -> WindowOperationResult<bool> {
+            self.calls.borrow_mut().push("is_enabled");
+            if self.fail_query.get() {
+                Err(WindowOperationError::new("autostart query failed"))
+            } else {
+                Ok(self.enabled.get())
+            }
+        }
+
+        fn enable(&self) -> WindowOperationResult {
+            self.calls.borrow_mut().push("enable");
+            if self.fail_enable.replace(false) {
+                Err(WindowOperationError::new("autostart enable failed"))
+            } else {
+                self.enabled.set(true);
+                Ok(())
+            }
+        }
+
+        fn disable(&self) -> WindowOperationResult {
+            self.calls.borrow_mut().push("disable");
+            if self.fail_disable.replace(false) {
+                Err(WindowOperationError::new("autostart disable failed"))
+            } else {
+                self.enabled.set(false);
                 Ok(())
             }
         }
@@ -1028,5 +1168,181 @@ mod tests {
 
         assert!(error.requires_shutdown());
         assert!(state.persisted_settings().locked);
+    }
+
+    #[test]
+    fn autostart_toggle_updates_native_tray_then_persisted_state() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart::default();
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, true);
+
+        let settings = WindowStateController::new(&mut state)
+            .set_autostart_from_tray(&autostart, &tray)
+            .unwrap();
+
+        assert_eq!(&*autostart.calls.borrow(), &["is_enabled", "enable"]);
+        assert!(autostart.enabled.get());
+        assert!(tray.is_checked(AUTOSTART_MENU_ID).unwrap());
+        assert!(settings.autostart);
+        assert!(state.persisted_settings().autostart);
+    }
+
+    #[test]
+    fn autostart_disable_updates_native_tray_then_persisted_state() {
+        let mut settings = UiSettings::default();
+        settings.autostart = true;
+        let mut state =
+            RuntimeWindowState::from_settings(PhysicalRect::new(0.0, 0.0, 164.0, 154.0), settings);
+        let autostart = FakeAutostart {
+            enabled: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, false);
+
+        let settings = WindowStateController::new(&mut state)
+            .set_autostart_from_tray(&autostart, &tray)
+            .unwrap();
+
+        assert_eq!(&*autostart.calls.borrow(), &["is_enabled", "disable"]);
+        assert!(!autostart.enabled.get());
+        assert!(!tray.is_checked(AUTOSTART_MENU_ID).unwrap());
+        assert!(!settings.autostart);
+        assert!(!state.persisted_settings().autostart);
+    }
+
+    #[test]
+    fn autostart_query_failure_restores_menu_and_keeps_state() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart {
+            fail_query: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, true);
+
+        let result =
+            WindowStateController::new(&mut state).set_autostart_from_tray(&autostart, &tray);
+
+        assert!(result.is_err());
+        assert!(!state.persisted_settings().autostart);
+        assert!(!tray.is_checked(AUTOSTART_MENU_ID).unwrap());
+        assert_eq!(&*autostart.calls.borrow(), &["is_enabled"]);
+    }
+
+    #[test]
+    fn autostart_native_failure_restores_menu_and_keeps_state() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart {
+            fail_enable: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, true);
+
+        let result =
+            WindowStateController::new(&mut state).set_autostart_from_tray(&autostart, &tray);
+
+        assert!(result.is_err());
+        assert!(!state.persisted_settings().autostart);
+        assert!(!autostart.enabled.get());
+        assert!(!tray.is_checked(AUTOSTART_MENU_ID).unwrap());
+        assert_eq!(
+            &*autostart.calls.borrow(),
+            &["is_enabled", "enable", "disable"]
+        );
+    }
+
+    #[test]
+    fn autostart_tray_failure_compensates_native_state_before_persisting() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart::default();
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, true);
+        tray.fail_next_write.set(true);
+
+        let result =
+            WindowStateController::new(&mut state).set_autostart_from_tray(&autostart, &tray);
+
+        assert!(result.is_err());
+        assert!(!state.persisted_settings().autostart);
+        assert!(!autostart.enabled.get());
+        assert!(!tray.is_checked(AUTOSTART_MENU_ID).unwrap());
+        assert_eq!(
+            &*autostart.calls.borrow(),
+            &["is_enabled", "enable", "disable"]
+        );
+    }
+
+    #[test]
+    fn autostart_toggle_compensation_failure_requires_shutdown() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart {
+            fail_disable: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, true);
+        tray.fail_next_write.set(true);
+
+        let error = WindowStateController::new(&mut state)
+            .set_autostart_from_tray(&autostart, &tray)
+            .unwrap_err();
+
+        assert!(error.requires_shutdown());
+        assert!(!state.persisted_settings().autostart);
+        assert!(autostart.enabled.get());
+    }
+
+    #[test]
+    fn autostart_startup_reconciles_tray_and_settings_from_native_state() {
+        let mut settings = UiSettings::default();
+        settings.autostart = false;
+        let mut state =
+            RuntimeWindowState::from_settings(PhysicalRect::new(0.0, 0.0, 164.0, 154.0), settings);
+        let autostart = FakeAutostart {
+            enabled: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, false);
+
+        let settings = WindowStateController::new(&mut state)
+            .reconcile_autostart(&autostart, Some(&tray))
+            .unwrap();
+
+        assert!(settings.autostart);
+        assert!(state.persisted_settings().autostart);
+        assert!(tray.is_checked(AUTOSTART_MENU_ID).unwrap());
+        assert_eq!(&*autostart.calls.borrow(), &["is_enabled"]);
+    }
+
+    #[test]
+    fn autostart_startup_reconciles_settings_when_tray_is_unavailable() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart {
+            enabled: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+
+        let settings = WindowStateController::new(&mut state)
+            .reconcile_autostart(&autostart, None::<&FakeTray>)
+            .unwrap();
+
+        assert!(settings.autostart);
+        assert!(state.persisted_settings().autostart);
+        assert_eq!(&*autostart.calls.borrow(), &["is_enabled"]);
+    }
+
+    #[test]
+    fn autostart_startup_tray_failure_does_not_commit_settings() {
+        let mut state = RuntimeWindowState::new(PhysicalRect::new(0.0, 0.0, 164.0, 154.0));
+        let autostart = FakeAutostart {
+            enabled: Cell::new(true),
+            ..FakeAutostart::default()
+        };
+        let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, false);
+        tray.fail_next_write.set(true);
+
+        let result = WindowStateController::new(&mut state)
+            .reconcile_autostart(&autostart, Some(&tray));
+
+        assert!(result.is_err());
+        assert!(!state.persisted_settings().autostart);
+        assert!(!tray.is_checked(AUTOSTART_MENU_ID).unwrap());
     }
 }
