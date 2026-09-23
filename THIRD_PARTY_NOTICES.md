@@ -1,8 +1,21 @@
 # Third-Party Notices
 
-Codex Pet is implemented from scratch. No third-party desktop-pet source code or artwork is currently copied into this repository.
+Codex Pet is implemented from scratch. No third-party desktop-pet source code or artwork is copied into this repository.
 
-The following projects were reviewed as architectural references:
+## Distributed software components
+
+The desktop application is built with the following direct components. Their resolved versions are recorded in `src-tauri/Cargo.lock` and `pnpm-lock.yaml`; each component remains subject to its own license terms.
+
+- [Tauri](https://tauri.app/) and its official Autostart and Opener plugins — desktop runtime, window, tray, installer, autostart, and shell integration.
+- [React](https://react.dev/) and [React DOM](https://react.dev/) — user interface rendering.
+- [Serde](https://serde.rs/) and serde_json — Rust data serialization.
+- [windows-sys](https://github.com/microsoft/windows-rs) — Windows API bindings.
+
+Build-only tooling, including TypeScript, Vite, Vitest, Testing Library, and the Tauri CLI, is also recorded in `package.json` and `pnpm-lock.yaml`.
+
+## Architectural references
+
+The following projects were reviewed as architectural references only:
 
 ## QimoBar
 
@@ -28,4 +41,4 @@ The following projects were reviewed as architectural references:
 - License: Apache-2.0
 - Usage: Protocol reference for the local Codex App Server. No Codex source code is copied.
 
-All visual assets created for Codex Pet must be original or have a separately verified redistribution license.
+All visual assets created for Codex Pet are original or must have a separately verified redistribution license before inclusion.

@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Codex Pet",
   "version": "0.1.0",
-  "identifier": "dev.codexpet.app",
+  "identifier": "io.github.fristyya.codex-pet",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",

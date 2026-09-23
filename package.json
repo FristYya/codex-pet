@@ -2,6 +2,12 @@
   "name": "codex-pet",
   "private": true,
   "version": "0.1.0",
+  "description": "A lightweight Windows desktop pet for monitoring local Codex usage limits",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FristYya/codex-pet.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

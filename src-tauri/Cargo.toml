@@ -1,8 +1,10 @@
 [package]
 name = "codex-pet"
 version = "0.1.0"
-description = "A lightweight desktop pet for monitoring Codex usage limits"
+description = "A lightweight Windows desktop pet for monitoring local Codex usage limits"
 authors = ["Codex Pet contributors"]
+license = "MIT"
+repository = "https://github.com/FristYya/codex-pet"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

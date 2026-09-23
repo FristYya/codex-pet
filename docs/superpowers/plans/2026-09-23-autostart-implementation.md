@@ -57,7 +57,7 @@
 **Files:**
 - Modify: `CHANGELOG.md`
 - Modify: `DEVLOG.md`
-- Modify: `C:\Users\杨敬辉\Desktop\Codex额度监控器.codex-local\PROJECT_STATE.md`（本地仓库外）
+- Modify: 仓库同级的本地接力状态文件 `Codex额度监控器.codex-local/PROJECT_STATE.md`（不纳入 Git）
 
 - [x] 运行完整前端测试、Rust 测试、Clippy、生产构建和 `git diff --check`。
 - [x] Windows 人工验收开启、退出/重开后状态恢复、关闭及最终关闭状态；Release 正常，Debug 注册当前 Debug exe（Windows 启动 UI 呈灰色，已按其为开发构建行为记录）。
