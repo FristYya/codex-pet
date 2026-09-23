@@ -15,10 +15,10 @@ Codex Pet is an independent open-source project and is not an official OpenAI pr
 ## 系统要求
 
 - Windows 10 或 Windows 11。
-- 已安装 Codex CLI，并已使用你的 ChatGPT 账号完成登录。
+- 已安装 Codex CLI 或 Codex Desktop，并已使用你的 ChatGPT 账号完成登录。
 - 设备可正常启动 `codex app-server --stdio`。
 
-Codex Pet 不会替你登录，也不会读取 `auth.json`、密码、Cookie 或 Token。如果 Codex CLI 未安装、未登录或无法读取额度，桌宠会显示不可用状态；请先在终端完成 Codex CLI 的安装和登录。
+Codex Pet 不会替你登录，也不会读取 `auth.json`、密码、Cookie 或 Token。它会优先使用 PATH 中的 Codex CLI；在 Windows 上也支持 Codex Desktop 的本机安装。若 Codex 未安装、未登录或无法读取额度，桌宠会显示不可用状态。
 
 ## 安装
 

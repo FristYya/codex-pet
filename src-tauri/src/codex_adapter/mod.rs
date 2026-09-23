@@ -13,7 +13,7 @@ use std::{
         mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const APP_SERVER_ARGS: [&str; 2] = ["app-server", "--stdio"];
@@ -1120,8 +1120,18 @@ fn read_stderr(mut stderr: Box<dyn Read + Send>, state: Arc<ClientState>, limit:
 }
 
 fn locate_codex() -> Result<PathBuf, AdapterError> {
-    let path = env::var_os("PATH").ok_or(AdapterError::ExecutableNotFound)?;
-    find_codex_in_path(&path)
+    if let Some(path) = env::var_os("PATH")
+        && let Ok(executable) = find_codex_in_path(&path)
+    {
+        return Ok(executable);
+    }
+
+    #[cfg(windows)]
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        return find_codex_in_desktop_installation(Path::new(&local_app_data));
+    }
+
+    Err(AdapterError::ExecutableNotFound)
 }
 
 fn find_codex_in_path(path: &OsStr) -> Result<PathBuf, AdapterError> {
@@ -1138,6 +1148,40 @@ fn find_codex_in_path(path: &OsStr) -> Result<PathBuf, AdapterError> {
         }
     }
     Err(AdapterError::ExecutableNotFound)
+}
+
+fn find_codex_in_desktop_installation(local_app_data: &Path) -> Result<PathBuf, AdapterError> {
+    let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let installation_root = local_app_data.join("OpenAI").join("Codex").join("bin");
+    let installation_root = installation_root
+        .canonicalize()
+        .map_err(|_| AdapterError::ExecutableNotFound)?;
+    let mut candidates: Vec<(PathBuf, Option<SystemTime>)> = std::fs::read_dir(&installation_root)
+        .map_err(|_| AdapterError::ExecutableNotFound)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let candidate = entry.path().join(executable_name);
+            if !candidate.is_file() {
+                return None;
+            }
+            let canonical = candidate.canonicalize().ok()?;
+            if !canonical.starts_with(&installation_root) {
+                return None;
+            }
+            let modified = candidate.metadata().and_then(|metadata| metadata.modified()).ok();
+            Some((canonical, modified))
+        })
+        .collect();
+    candidates.sort_by(|(path_a, modified_a), (path_b, modified_b)| {
+        modified_b
+            .cmp(modified_a)
+            .then_with(|| path_b.cmp(path_a))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|(candidate, _)| candidate)
+        .ok_or(AdapterError::ExecutableNotFound)
 }
 
 #[derive(Clone, Copy)]
@@ -1901,6 +1945,29 @@ mod tests {
         assert!(find_codex_in_path(&OsString::from("relative")).is_err());
         std::fs::remove_file(executable).unwrap();
         std::fs::remove_dir(temp).unwrap();
+    }
+
+    #[test]
+    fn finds_codex_in_the_current_desktop_installation_layout() {
+        let temp = std::env::temp_dir().join(format!(
+            "codex-pet-desktop-install-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let directory = temp.join("OpenAI").join("Codex").join("bin").join("current");
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        std::fs::write(&executable, []).unwrap();
+
+        assert_eq!(
+            find_codex_in_desktop_installation(&temp).unwrap(),
+            executable.canonicalize().unwrap()
+        );
+
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
