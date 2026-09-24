@@ -49,6 +49,60 @@ describe("PetShell", () => {
     expect(onExpandedChange).toHaveBeenLastCalledWith(true);
   });
 
+  it("同时存在 5H 和 Weekly 时主额度固定显示 5H", () => {
+    const mixedSnapshot = {
+      ...snapshot,
+      windows: [
+        { ...snapshot.windows[0], remainingPercent: 88 },
+        { ...snapshot.windows[1], remainingPercent: 24 },
+      ],
+    };
+    render(<PetShell snapshot={mixedSnapshot} onExpandedChange={() => undefined} onRefresh={() => undefined} />);
+
+    expect(screen.getByText("88%")).toBeInTheDocument();
+    expect(screen.getByText("5小时额度")).toBeInTheDocument();
+  });
+
+  it("5H 与 Weekly 顺序反转时仍把 5H 放在主位和详情首行", async () => {
+    const mixedSnapshot = {
+      ...snapshot,
+      windows: [
+        { ...snapshot.windows[1], remainingPercent: 24 },
+        { ...snapshot.windows[0], remainingPercent: 88 },
+      ],
+    };
+    const user = userEvent.setup();
+    render(<PetShell snapshot={mixedSnapshot} onExpandedChange={() => undefined} onRefresh={() => undefined} />);
+
+    expect(screen.getByText("88%")).toBeInTheDocument();
+    expect(screen.getByText("5小时额度")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "展开额度详情" }));
+    expect(screen.getAllByRole("article")[0]).toHaveTextContent("5H");
+    expect(screen.getAllByRole("article")[1]).toHaveTextContent("Weekly");
+  });
+
+  it("只有 Weekly 时仍显示周额度及其数值", () => {
+    const weeklyOnly = { ...snapshot, windows: [snapshot.windows[1]] };
+    render(<PetShell snapshot={weeklyOnly} onExpandedChange={() => undefined} onRefresh={() => undefined} />);
+
+    expect(screen.getByText("82%")).toBeInTheDocument();
+    expect(screen.getByText("周额度")).toBeInTheDocument();
+  });
+
+  it("5H 数据无效时回退到有效 Weekly", () => {
+    const mixedSnapshot = {
+      ...snapshot,
+      windows: [
+        { ...snapshot.windows[0], remainingPercent: 101 },
+        { ...snapshot.windows[1], remainingPercent: 24 },
+      ],
+    };
+    render(<PetShell snapshot={mixedSnapshot} onExpandedChange={() => undefined} onRefresh={() => undefined} />);
+
+    expect(screen.getByText("24%")).toBeInTheDocument();
+    expect(screen.getByText("周额度")).toBeInTheDocument();
+  });
+
   it("鼠标离开后延迟收起详情", async () => {
     const onExpandedChange = vi.fn();
     const { container } = render(

@@ -16,7 +16,9 @@ button { font: inherit; }
 .pet-mouth, .pet-eye-line, .pet-feet { fill: none; stroke: #c3ffe9; stroke-width: 3; stroke-linecap: round; }
 .pet-feet { stroke: #52d4a7; stroke-width: 5; }
 .pet-unavailable .pet-ear, .pet-unknown .pet-ear, .pet-unavailable .pet-feet, .pet-unknown .pet-feet { stroke: #8492a6; }
-.quota-pill { position: absolute; left: 50%; bottom: 9px; transform: translateX(-50%); min-width: 54px; padding: 3px 9px; border: 1px solid rgba(147, 255, 217, .22); border-radius: 99px; color: #d9fff1; background: rgba(6, 21, 26, .86); font-size: 14px; font-weight: 800; line-height: 18px; white-space: nowrap; }
+.quota-pill { position: absolute; left: 50%; bottom: 9px; transform: translateX(-50%); display: flex; align-items: baseline; gap: 4px; min-width: 54px; padding: 3px 9px; border: 1px solid rgba(147, 255, 217, .22); border-radius: 99px; color: #d9fff1; background: rgba(6, 21, 26, .86); font-size: 14px; font-weight: 800; line-height: 18px; white-space: nowrap; }
+.quota-pill strong { font-size: inherit; line-height: inherit; }
+.quota-pill small { color: #9deccc; font-size: 8px; font-weight: 700; line-height: 12px; }
 .pet-unavailable .quota-pill, .pet-unknown .quota-pill { color: #d1d5db; font-size: 11px; }
 .is-expanded { align-items: flex-start; }
 .is-expanded .pet-button { width: 116px; height: 108px; padding: 0 4px 18px; border-radius: 34px; }
@@ -43,8 +45,13 @@ button { font: inherit; }
 .empty-state { display: grid; place-content: center; min-height: 148px; text-align: center; }
 .empty-state strong { color: #d3dae3; font-size: 15px; }
 .empty-state span { margin-top: 5px; color: #7f909d; font-size: 11px; }
-.quota-actions { position: absolute; left: 20px; bottom: 12px; }
+.quota-actions { position: absolute; left: 20px; bottom: 12px; display: flex; align-items: center; gap: 8px; }
 .quota-actions button { padding: 4px 9px; border: 1px solid rgba(141, 241, 204, .24); border-radius: 99px; color: #bbf5df; background: rgba(55, 187, 143, .1); font-size: 10px; cursor: pointer; }
 .quota-actions button:hover { background: rgba(55, 187, 143, .2); }
+.quota-actions button:disabled { opacity: .72; cursor: wait; }
 .quota-actions button:focus-visible { outline: 2px solid #72e9c0; outline-offset: 2px; }
+.refresh-spinner { display: inline-block; width: 10px; height: 10px; margin-right: 5px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -1px; animation: refresh-spin .8s linear infinite; }
+.refresh-feedback { min-width: 50px; color: #9deccc; font-size: 9px; white-space: nowrap; }
+.refresh-feedback-error { color: #ffaaa4; }
+@keyframes refresh-spin { to { transform: rotate(360deg); } }
 .quota-card footer { position: absolute; right: 20px; bottom: 15px; color: #667882; font-size: 9px; }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { selectPrimaryWindow } from "../quota/normalize";
 import type { QuotaSnapshot } from "../quota/types";
 import type { AccountStatus } from "../account/types";
 
@@ -6,6 +7,7 @@ type PetShellProps = {
   snapshot: QuotaSnapshot;
   accountStatus?: AccountStatus;
   locked?: boolean;
+  refreshState?: "idle" | "loading" | "success" | "error";
   onExpandedChange: (expanded: boolean) => void;
   onStartDragging?: () => void;
   onRefresh: () => void;
@@ -56,6 +58,7 @@ export function PetShell({
   snapshot,
   accountStatus = "loggedIn",
   locked = false,
+  refreshState = "idle",
   onExpandedChange,
   onStartDragging,
   onRefresh,
@@ -69,7 +72,10 @@ export function PetShell({
   const gesture = useRef<DragGesture | null>(null);
   const suppressNextBodyClick = useRef(false);
   const suppressClickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const tightestWindow = useMemo(() => [...snapshot.windows].sort((a, b) => a.remainingPercent - b.remainingPercent)[0], [snapshot.windows]);
+  const primaryWindow = useMemo(() => selectPrimaryWindow(snapshot.windows), [snapshot.windows]);
+  const detailWindows = useMemo(() => primaryWindow
+    ? [primaryWindow, ...snapshot.windows.filter((window) => window !== primaryWindow)]
+    : snapshot.windows, [primaryWindow, snapshot.windows]);
 
   const clearGesture = () => {
     if (dragTimer.current) clearTimeout(dragTimer.current);
@@ -135,7 +141,12 @@ export function PetShell({
     collapseTimer.current = setTimeout(() => changeExpanded(false), AUTO_COLLAPSE_MS);
   };
   const cancelCollapse = () => { if (collapseTimer.current) clearTimeout(collapseTimer.current); };
-  const headline = tightestWindow ? `${Math.round(tightestWindow.remainingPercent)}%` : snapshot.availability === "blocked" ? "已暂停" : "额度暂不可用";
+  const headline = primaryWindow ? `${Math.round(primaryWindow.remainingPercent)}%` : snapshot.availability === "blocked" ? "已暂停" : "额度暂不可用";
+  const primaryLabel = primaryWindow?.windowDurationMins === 300 || primaryWindow?.name === "5H"
+    ? "5小时额度"
+    : primaryWindow?.windowDurationMins === 10_080 || primaryWindow?.name.toLowerCase() === "weekly"
+      ? "周额度"
+      : primaryWindow?.name === "Unknown" ? null : primaryWindow?.name;
   const needsLogin = accountStatus !== "loggedIn";
   const accountCard = accountStatus === "loggingIn"
     ? { title: "正在等待浏览器登录…", action: "取消", onAction: onCancelChatgptLogin }
@@ -179,7 +190,7 @@ export function PetShell({
         }}
       >
         <PetFace availability={snapshot.availability} />
-        <span className="quota-pill">{headline}</span>
+        <span className="quota-pill"><strong>{headline}</strong>{primaryLabel && <small>{primaryLabel}</small>}</span>
       </button>
       {needsLogin ? <section className="account-card" aria-label="ChatGPT 登录状态">
         <p className="eyebrow">CODEX PET</p>
@@ -187,13 +198,26 @@ export function PetShell({
         {accountCard.action && <button type="button" onClick={accountCard.onAction}>{accountCard.action}</button>}
       </section> : expanded && <section className="quota-card" aria-label="Codex 额度详情">
         <header><div><p className="eyebrow">CODEX PET</p><h1>额度状态</h1></div><span className={`status-dot status-${snapshot.availability}`}>{snapshot.stale ? "更新失败" : "本机读取"}</span></header>
-        {snapshot.windows.length ? <div className="quota-list">{snapshot.windows.map((window) => <article className="quota-row" key={window.id}>
+        {snapshot.windows.length ? <div className="quota-list">{detailWindows.map((window) => <article className="quota-row" key={window.id}>
           <div className="quota-row-heading"><strong>{window.name}</strong><span>{Math.round(window.remainingPercent)}% 剩余</span></div>
           <div className="quota-track" aria-hidden="true"><span style={{ width: `${window.remainingPercent}%` }} /></div>
           <small>{resetLabel(window.resetsAt)}</small>
         </article>)}</div> : <div className="empty-state"><strong>{snapshot.message ?? "额度暂不可用"}</strong><span>请确认 Codex CLI 已登录</span></div>}
         <div className="quota-actions">
-          <button type="button" onClick={onRefresh}>刷新额度</button>
+          <button
+            type="button"
+            disabled={refreshState === "loading"}
+            aria-busy={refreshState === "loading"}
+            onClick={() => {
+              if (refreshState !== "loading") onRefresh();
+            }}
+          >
+            {refreshState === "loading" && <span className="refresh-spinner" aria-hidden="true" />}
+            {refreshState === "loading" ? "刷新中…" : "刷新额度"}
+          </button>
+          <span className={`refresh-feedback refresh-feedback-${refreshState}`} role="status" aria-live="polite" aria-atomic="true">
+            {refreshState === "loading" ? "刷新中…" : refreshState === "success" ? "额度已更新" : refreshState === "error" ? "刷新失败" : ""}
+          </span>
         </div>
         <footer>{snapshot.planType ? `${snapshot.planType} 方案` : "等待本机 Codex"}</footer>
       </section>}

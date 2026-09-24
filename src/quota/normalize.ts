@@ -99,6 +99,37 @@ export function selectTightestWindow(windows: readonly QuotaWindow[]): QuotaWind
   }, null);
 }
 
+function isUsableWindow(window: QuotaWindow): boolean {
+  return Number.isFinite(window.remainingPercent)
+    && window.remainingPercent >= 0
+    && window.remainingPercent <= 100;
+}
+
+function windowPriority(window: QuotaWindow): number {
+  const duration = window.windowDurationMins;
+  const name = window.name.trim().toLowerCase();
+  if (duration === 300 || (duration === null && /^(5h|5\s*hours?)$/.test(name))) return 0;
+  if (duration === 10_080 || (duration === null && /^(weekly|week|周额度)$/.test(name))) return 2;
+  if (duration !== null && Number.isFinite(duration) && duration > 0 && duration < 10_080) return 1;
+  return 3;
+}
+
+/** Selects the main window by quota cycle, keeping the tightest-window behavior as a fallback. */
+export function selectPrimaryWindow(windows: readonly QuotaWindow[]): QuotaWindow | null {
+  const usable = windows.filter(isUsableWindow);
+  const knownCycleWindows = usable.filter((window) => windowPriority(window) < 3);
+  if (knownCycleWindows.length === 0) return selectTightestWindow(usable);
+
+  return [...knownCycleWindows].sort((left, right) => {
+    const priorityDifference = windowPriority(left) - windowPriority(right);
+    if (priorityDifference !== 0) return priorityDifference;
+    if (windowPriority(left) === 1 && left.windowDurationMins !== right.windowDurationMins) {
+      return (left.windowDurationMins ?? Infinity) - (right.windowDurationMins ?? Infinity);
+    }
+    return left.remainingPercent - right.remainingPercent;
+  })[0] ?? null;
+}
+
 /** Formats a non-negative countdown from Unix-second timestamps. */
 export function formatResetCountdown(resetsAt: number | null, now = Math.floor(Date.now() / 1000)): string {
   if (resetsAt === null || !Number.isFinite(resetsAt)) return "重置时间未知";

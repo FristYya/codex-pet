@@ -3,6 +3,7 @@ import {
   formatResetCountdown,
   formatWindowLabel,
   normalizeQuotaResponse,
+  selectPrimaryWindow,
   selectTightestWindow,
 } from "./normalize";
 
@@ -153,5 +154,47 @@ describe("normalizeQuotaResponse", () => {
       ]),
     ).toMatchObject({ id: "secondary" });
     expect(selectTightestWindow([])).toBeNull();
+  });
+});
+
+describe("selectPrimaryWindow", () => {
+  const fiveHour = {
+    id: "custom-fast-limit",
+    name: "5H",
+    usedPercent: 12,
+    remainingPercent: 88,
+    windowDurationMins: 300,
+    resetsAt: null,
+  };
+  const weekly = {
+    id: "custom-week-limit",
+    name: "Weekly",
+    usedPercent: 76,
+    remainingPercent: 24,
+    windowDurationMins: 10_080,
+    resetsAt: null,
+  };
+
+  it("同时存在 5 小时与 Weekly 时优先选择 5 小时额度", () => {
+    expect(selectPrimaryWindow([fiveHour, weekly])).toBe(fiveHour);
+  });
+
+  it("不依赖窗口返回顺序或动态 limitId", () => {
+    expect(selectPrimaryWindow([weekly, fiveHour])).toBe(fiveHour);
+  });
+
+  it("只有 Weekly 时回退到 Weekly", () => {
+    expect(selectPrimaryWindow([weekly])).toBe(weekly);
+  });
+
+  it("5 小时窗口无效时回退到有效 Weekly", () => {
+    expect(selectPrimaryWindow([{ ...fiveHour, remainingPercent: 101 }, weekly])).toBe(weekly);
+  });
+
+  it("没有已知周期时保留最紧张额度的兼容 fallback", () => {
+    const primary = { ...fiveHour, id: "primary", name: "Unknown", windowDurationMins: null, remainingPercent: 80 };
+    const secondary = { ...weekly, id: "secondary", name: "Unknown", windowDurationMins: null, remainingPercent: 20 };
+
+    expect(selectPrimaryWindow([primary, secondary])).toBe(secondary);
   });
 });

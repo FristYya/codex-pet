@@ -1,5 +1,13 @@
 # 开发日志
 
+## 2026-09-24：v0.1.1 刷新反馈与 5 小时额度优先展示
+
+- 手动刷新立即进入 loading，禁用重复点击并显示轻量旋转指示；刷新 Promise 完成后显示成功或失败反馈，提示 2.5 秒后清除。automatic/manual 调用复用前端进行中的 Promise，未改 Rust quota coordinator、single-flight、事件或 60 秒轮询。
+- 刷新失败继续保留最近成功额度并标记 stale；新增回归覆盖旧快照、失败反馈、并发调用复用、组件卸载与反馈 timer 清理。
+- 主额度依据窗口语义排序：300 分钟 5H、其他短周期、Weekly；详情也将所选主额度置顶。只有 Weekly 或缺少可识别周期时沿用有效额度 fallback，不依赖返回数组顺序或固定 limitId。
+- 自动化验证通过：Rust 115 项、前端 51 项、`cargo fmt -- --check`、`cargo clippy -- -D warnings`、`pnpm build` 与 `git diff --check`。
+- 本轮未重新启动桌面窗口进行真实按钮点击和真实 5H/Weekly 并列额度人工验收；当前环境没有可用的原生窗口交互通道，不能将自动化测试称作真机人工验证。
+
 ## 2026-09-24：Bundled Runtime、登录恢复与生命周期验收
 
 - 固定官方 `@openai/codex@0.156.1-win32-x64` 包及 SHA-512 SRI；Tauri 将 Runtime 作为安装资源打包，运行时从应用 exe 相邻的 `resources/codex-runtime/bin/codex.exe` 定位。

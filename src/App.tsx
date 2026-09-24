@@ -17,12 +17,18 @@ const initialSnapshot: QuotaSnapshot = {
   message: "正在读取 Codex 额度…",
 };
 
+type RefreshFeedback = "idle" | "loading" | "success" | "error";
+
 function App() {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot>(initialSnapshot);
   const [accountStatus, setAccountStatus] = useState<AccountStatus>("checking");
+  const [refreshFeedback, setRefreshFeedback] = useState<RefreshFeedback>("idle");
   const accountEventVersion = useRef(0);
   const [locked, setLocked] = useState(false);
   const hasSuccessfulSnapshot = useRef(false);
+  const isMounted = useRef(false);
+  const quotaRefreshPromise = useRef<Promise<boolean> | null>(null);
+  const manualRefreshActive = useRef(false);
   const acceptSnapshot = useCallback((nextSnapshot: QuotaSnapshot) => {
     hasSuccessfulSnapshot.current = true;
     setSnapshot(nextSnapshot);
@@ -33,14 +39,54 @@ function App() {
       ? { ...previous, stale: true, message }
       : { ...initialSnapshot, message });
   }, []);
-  const refresh = useCallback(async (source: "automatic" | "manual" = "manual") => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    try {
-      acceptSnapshot(await invoke<QuotaSnapshot>("read_quota", { source }));
-    } catch (error) {
-      markUpdateFailed(error);
-    }
+  const refresh = useCallback((source: "automatic" | "manual" = "manual"): Promise<boolean> => {
+    if (!("__TAURI_INTERNALS__" in window)) return Promise.resolve(false);
+    if (quotaRefreshPromise.current) return quotaRefreshPromise.current;
+
+    const operation = Promise.resolve()
+      .then(() => invoke<QuotaSnapshot>("read_quota", { source }))
+      .then((nextSnapshot) => {
+        if (isMounted.current) acceptSnapshot(nextSnapshot);
+        return true;
+      })
+      .catch((error: unknown) => {
+        if (isMounted.current) markUpdateFailed(error);
+        return false;
+      });
+    let trackedOperation: Promise<boolean>;
+    trackedOperation = operation.finally(() => {
+      if (quotaRefreshPromise.current === trackedOperation) quotaRefreshPromise.current = null;
+    });
+    quotaRefreshPromise.current = trackedOperation;
+    return trackedOperation;
   }, [acceptSnapshot, markUpdateFailed]);
+
+  const refreshManually = useCallback(async () => {
+    if (manualRefreshActive.current) return;
+    manualRefreshActive.current = true;
+    setRefreshFeedback("loading");
+    try {
+      const succeeded = await refresh("manual");
+      if (isMounted.current) setRefreshFeedback(succeeded ? "success" : "error");
+    } finally {
+      manualRefreshActive.current = false;
+    }
+  }, [refresh]);
+
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (refreshFeedback !== "success" && refreshFeedback !== "error") return;
+    const timer = window.setTimeout(() => {
+      if (isMounted.current) setRefreshFeedback("idle");
+    }, 2_500);
+    return () => window.clearTimeout(timer);
+  }, [refreshFeedback]);
 
   useEffect(() => {
     if (accountStatus !== "loggedIn") return;
@@ -167,9 +213,10 @@ function App() {
       snapshot={snapshot}
       accountStatus={accountStatus}
       locked={locked}
+      refreshState={refreshFeedback}
       onExpandedChange={resizeForDetails}
       onStartDragging={startDragging}
-      onRefresh={() => void refresh("manual")}
+      onRefresh={() => void refreshManually()}
       onRetryAccountStatus={() => void retryAccountStatus()}
       onStartChatgptLogin={startChatgptLogin}
       onCancelChatgptLogin={cancelChatgptLogin}

@@ -240,6 +240,98 @@ describe("App 额度刷新", () => {
     expect(tauri.invoke).toHaveBeenLastCalledWith("read_quota", { source: "manual" });
   });
 
+  it("手动刷新立即显示 loading，成功后恢复按钮并短暂提示成功", async () => {
+    const pending = deferred<QuotaSnapshot>();
+    let quotaReads = 0;
+    tauri.invoke.mockImplementation((command) => {
+      if (command === "read_window_locked") return Promise.resolve(false);
+      if (command === "read_account_status") return Promise.resolve("loggedIn");
+      quotaReads += 1;
+      return quotaReads === 1 ? Promise.resolve(snapshot) : pending.promise;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByText("36%")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "展开额度详情" }));
+
+    await user.click(screen.getByRole("button", { name: "刷新额度" }));
+
+    const loadingButton = screen.getByRole("button", { name: "刷新中…" });
+    expect(loadingButton).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("刷新中…");
+
+    await act(async () => pending.resolve(updatedSnapshot));
+
+    expect(await screen.findByRole("button", { name: "刷新额度" })).toBeEnabled();
+    expect(await screen.findByText("额度已更新")).toBeInTheDocument();
+    expect(screen.getByText("59%")).toBeInTheDocument();
+  });
+
+  it("成功反馈在短暂显示后自动消失", async () => {
+    vi.useFakeTimers();
+    const pending = deferred<QuotaSnapshot>();
+    let quotaReads = 0;
+    tauri.invoke.mockImplementation((command) => {
+      if (command === "read_window_locked") return Promise.resolve(false);
+      if (command === "read_account_status") return Promise.resolve("loggedIn");
+      quotaReads += 1;
+      return quotaReads === 1 ? Promise.resolve(snapshot) : pending.promise;
+    });
+    render(<App />);
+    await act(async () => undefined);
+    expect(screen.getByText("36%")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "展开额度详情" }));
+    fireEvent.click(screen.getByRole("button", { name: "刷新额度" }));
+    await act(async () => pending.resolve(updatedSnapshot));
+
+    expect(screen.getByText("额度已更新")).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTimeAsync(2_500));
+    expect(screen.queryByText("额度已更新")).not.toBeInTheDocument();
+  });
+
+  it("刷新进行中重复点击不会再触发 read_quota", async () => {
+    const pending = deferred<QuotaSnapshot>();
+    let quotaReads = 0;
+    tauri.invoke.mockImplementation((command) => {
+      if (command === "read_window_locked") return Promise.resolve(false);
+      if (command === "read_account_status") return Promise.resolve("loggedIn");
+      quotaReads += 1;
+      return quotaReads === 1 ? Promise.resolve(snapshot) : pending.promise;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByText("36%")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "展开额度详情" }));
+    const refreshButton = screen.getByRole("button", { name: "刷新额度" });
+
+    await user.click(refreshButton);
+    fireEvent.click(refreshButton);
+
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "read_quota")).toHaveLength(2);
+    await act(async () => pending.resolve(snapshot));
+  });
+
+  it("手动刷新复用进行中的自动刷新 Promise", async () => {
+    const pending = deferred<QuotaSnapshot>();
+    tauri.invoke.mockImplementation((command) => {
+      if (command === "read_window_locked") return Promise.resolve(false);
+      if (command === "read_account_status") return Promise.resolve("loggedIn");
+      return pending.promise;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(tauri.invoke.mock.calls.filter(([command]) => command === "read_quota")).toHaveLength(1);
+    });
+    await user.click(screen.getByRole("button", { name: "展开额度详情" }));
+    await user.click(screen.getByRole("button", { name: "刷新额度" }));
+
+    expect(screen.getByRole("button", { name: "刷新中…" })).toBeDisabled();
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "read_quota")).toHaveLength(1);
+    await act(async () => pending.resolve(snapshot));
+    expect(await screen.findByText("额度已更新")).toBeInTheDocument();
+  });
+
   it("刷新失败时保留最后成功百分比并显示更新失败", async () => {
     let quotaReads = 0;
     tauri.invoke.mockImplementation((command) => {
@@ -255,7 +347,31 @@ describe("App 额度刷新", () => {
     fireEvent.click(screen.getByRole("button", { name: "刷新额度" }));
 
     expect(await screen.findByText("更新失败")).toBeInTheDocument();
+    expect(await screen.findByText("刷新失败")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新额度" })).toBeEnabled();
     expect(screen.getAllByText("36%").length).toBeGreaterThan(0);
+  });
+
+  it("刷新进行中卸载会清理轮询计时器且不会遗留加载 UI", async () => {
+    vi.useFakeTimers();
+    const pending = deferred<QuotaSnapshot>();
+    let quotaReads = 0;
+    tauri.invoke.mockImplementation((command) => {
+      if (command === "read_window_locked") return Promise.resolve(false);
+      if (command === "read_account_status") return Promise.resolve("loggedIn");
+      quotaReads += 1;
+      return quotaReads === 1 ? Promise.resolve(snapshot) : pending.promise;
+    });
+    const view = render(<App />);
+    await act(async () => undefined);
+    fireEvent.click(screen.getByRole("button", { name: "展开额度详情" }));
+    fireEvent.click(screen.getByRole("button", { name: "刷新额度" }));
+    expect(screen.getByRole("button", { name: "刷新中…" })).toBeDisabled();
+
+    view.unmount();
+    expect(vi.getTimerCount()).toBe(0);
+    await act(async () => pending.resolve(updatedSnapshot));
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("收到锁定状态后标记为不可拖动", async () => {
