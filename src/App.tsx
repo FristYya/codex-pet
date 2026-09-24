@@ -81,6 +81,21 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        void invoke("record_react_first_frame").catch(() => undefined);
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, []);
+
+  useEffect(() => {
     if (refreshFeedback !== "success" && refreshFeedback !== "error") return;
     const timer = window.setTimeout(() => {
       if (isMounted.current) setRefreshFeedback("idle");

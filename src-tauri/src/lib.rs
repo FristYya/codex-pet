@@ -33,6 +33,7 @@ pub mod codex_adapter;
 pub mod quota;
 pub mod runtime;
 pub mod settings;
+mod startup_metrics;
 pub mod window_state;
 
 pub(crate) fn diagnostic(message: impl std::fmt::Display) {
@@ -924,32 +925,62 @@ impl AppState {
 }
 
 #[tauri::command]
-fn read_quota(state: tauri::State<'_, AppState>, source: Option<String>) -> QuotaSnapshot {
+async fn read_quota(
+    state: tauri::State<'_, AppState>,
+    source: Option<String>,
+) -> Result<QuotaSnapshot, String> {
     let source = match source.as_deref() {
         Some("manual") => "manual",
         _ => "automatic",
     };
     diagnostic(format!("quota command source={source} started"));
-    let snapshot = state.coordinator.refresh();
+    startup_metrics::record(startup_metrics::StartupStage::QuotaRefreshStarted);
+    // Runtime startup and App Server I/O are synchronous; keep them off the WebView IPC thread.
+    let coordinator = Arc::clone(&state.coordinator);
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = coordinator.refresh();
+        if snapshot.availability == "allowed" && !snapshot.stale && !snapshot.windows.is_empty() {
+            startup_metrics::record(startup_metrics::StartupStage::QuotaDataFresh);
+        }
+        startup_metrics::record(startup_metrics::StartupStage::QuotaRefreshComplete);
+        snapshot
+    })
+    .await
+    .map_err(|error| {
+        diagnostic(format!("quota read worker failed: {error}"));
+        error.to_string()
+    })?;
     diagnostic(format!(
         "quota command source={source} completed stale={}",
         snapshot.stale
     ));
-    snapshot
+    Ok(snapshot)
 }
 
 #[tauri::command]
-fn read_account_status<R: tauri::Runtime>(
+async fn read_account_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     account: tauri::State<'_, AccountState>,
     quota: tauri::State<'_, AppState>,
-) -> AccountStatus {
-    let (status, became_logged_in) = account.status();
+) -> Result<AccountStatus, String> {
+    let account = (*account).clone();
+    // Account status may need to select and start a Runtime before issuing account/read.
+    let account_read = tauri::async_runtime::spawn_blocking(move || account.status()).await;
+    let (status, became_logged_in) = account_read.map_err(|error| {
+        diagnostic(format!("account status worker failed: {error}"));
+        error.to_string()
+    })?;
+    startup_metrics::record(startup_metrics::StartupStage::AccountCheckComplete);
     if became_logged_in {
         (quota.reset)();
     }
     let _ = app.emit(ACCOUNT_UPDATED_EVENT, status);
-    status
+    Ok(status)
+}
+
+#[tauri::command]
+fn record_react_first_frame() {
+    startup_metrics::record(startup_metrics::StartupStage::ReactFirstFrame);
 }
 
 #[tauri::command]
@@ -1028,8 +1059,9 @@ fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_metrics::record(startup_metrics::StartupStage::StartupStarted);
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![read_quota, read_window_locked, read_account_status, start_chatgpt_login, cancel_chatgpt_login])
+        .invoke_handler(tauri::generate_handler![read_quota, read_window_locked, read_account_status, record_react_first_frame, start_chatgpt_login, cancel_chatgpt_login])
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
@@ -1037,13 +1069,16 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            startup_metrics::record(startup_metrics::StartupStage::SetupStarted);
             let settings_dir = app.path().app_config_dir()?;
             std::fs::create_dir_all(&settings_dir)?;
             let settings_path = settings_dir.join("ui-settings.json");
             let loaded = settings::load_settings(&settings_path);
+            startup_metrics::record(startup_metrics::StartupStage::SettingsLoaded);
             let window = app
                 .get_webview_window("main")
                 .ok_or_else(|| std::io::Error::other("missing main window"))?;
+            startup_metrics::record(startup_metrics::StartupStage::WindowHandleAvailable);
             let monitor = resolve_startup_monitor_for(
                 &TauriWebviewMonitorProvider { window: &window },
                 &loaded.settings.window,
@@ -1091,6 +1126,7 @@ pub fn run() {
                 initial_rect.x as i32,
                 initial_rect.y as i32,
             ));
+            startup_metrics::record(startup_metrics::StartupStage::WindowPositionRestored);
             let handle = app.handle().clone();
             let bundled_runtime = runtime::bundled_executable_for(&std::env::current_exe()?);
             let private_runtime_home = runtime::private_codex_home(&app.path().app_data_dir()?);
@@ -1098,46 +1134,79 @@ pub fn run() {
             let account_bundled_runtime = bundled_runtime.clone();
             let account_private_runtime_home = private_runtime_home.clone();
             app.manage(AppState::new(
-                move || match CodexClient::connect(Default::default()) {
+                move || {
+                    startup_metrics::record(
+                        startup_metrics::StartupStage::QuotaRuntimeSelectionStarted,
+                    );
+                    match CodexClient::connect(Default::default()) {
                     Ok(client) if client.has_chatgpt_login().unwrap_or(false) => {
+                        startup_metrics::record(startup_metrics::StartupStage::QuotaRuntimeSelected);
                         diagnostic("quota selected runtime=system");
+                        startup_metrics::record(startup_metrics::StartupStage::QuotaRuntimeReady);
                         Ok(client)
                     },
                     Ok(client) => {
                         drop(client);
+                        startup_metrics::record(startup_metrics::StartupStage::QuotaRuntimeSelected);
                         diagnostic(format!("quota selected runtime=bundled exe={} CODEX_HOME={}", bundled_runtime.display(), private_runtime_home.display()));
-                        CodexClient::connect_with_runtime(
+                        let result = CodexClient::connect_with_runtime(
                             Default::default(),
                             bundled_runtime.clone(),
                             Some(private_runtime_home.clone()),
-                        )
+                        );
+                        if result.is_ok() {
+                            startup_metrics::record(startup_metrics::StartupStage::QuotaRuntimeReady);
+                        }
+                        result
                     }
                     Err(error) => {
+                        startup_metrics::record(startup_metrics::StartupStage::QuotaRuntimeSelected);
                         diagnostic(format!("quota system runtime unavailable error={}; selecting bundled exe={} CODEX_HOME={}", adapter_error_kind(&error), bundled_runtime.display(), private_runtime_home.display()));
-                        CodexClient::connect_with_runtime(
-                        Default::default(),
-                        bundled_runtime.clone(),
-                        Some(private_runtime_home.clone()),
-                    )},
+                        let result = CodexClient::connect_with_runtime(
+                            Default::default(),
+                            bundled_runtime.clone(),
+                            Some(private_runtime_home.clone()),
+                        );
+                        if result.is_ok() {
+                            startup_metrics::record(startup_metrics::StartupStage::QuotaRuntimeReady);
+                        }
+                        result
+                    }
+                    }
                 },
                 move |event, snapshot| {
                     let _ = handle.emit(event, snapshot);
                 },
             ));
             app.manage(AccountState::new(move || {
+                startup_metrics::record(
+                    startup_metrics::StartupStage::AccountRuntimeSelectionStarted,
+                );
                 match CodexClient::connect(Default::default()) {
                     Ok(client) if client.has_chatgpt_login().unwrap_or(false) => {
+                        startup_metrics::record(startup_metrics::StartupStage::AccountRuntimeSelected);
                         diagnostic("account selected runtime=system");
+                        startup_metrics::record(startup_metrics::StartupStage::AccountRuntimeReady);
                         Ok(client)
                     },
                     Ok(client) => {
                         drop(client);
+                        startup_metrics::record(startup_metrics::StartupStage::AccountRuntimeSelected);
                         diagnostic(format!("account selected runtime=bundled exe={} CODEX_HOME={}", account_bundled_runtime.display(), account_private_runtime_home.display()));
-                        CodexClient::connect_with_runtime(Default::default(), account_bundled_runtime.clone(), Some(account_private_runtime_home.clone()))
+                        let result = CodexClient::connect_with_runtime(Default::default(), account_bundled_runtime.clone(), Some(account_private_runtime_home.clone()));
+                        if result.is_ok() {
+                            startup_metrics::record(startup_metrics::StartupStage::AccountRuntimeReady);
+                        }
+                        result
                     }
                     Err(error) => {
+                        startup_metrics::record(startup_metrics::StartupStage::AccountRuntimeSelected);
                         diagnostic(format!("account system runtime unavailable error={}; selecting bundled exe={} CODEX_HOME={}", adapter_error_kind(&error), account_bundled_runtime.display(), account_private_runtime_home.display()));
-                        CodexClient::connect_with_runtime(Default::default(), account_bundled_runtime.clone(), Some(account_private_runtime_home.clone()))
+                        let result = CodexClient::connect_with_runtime(Default::default(), account_bundled_runtime.clone(), Some(account_private_runtime_home.clone()));
+                        if result.is_ok() {
+                            startup_metrics::record(startup_metrics::StartupStage::AccountRuntimeReady);
+                        }
+                        result
                     },
                 }
             }));
@@ -1181,7 +1250,7 @@ pub fn run() {
                 };
                 let tray_for_event = tray.clone();
 
-                TrayIconBuilder::new()
+                let _tray_icon = TrayIconBuilder::new()
                     .icon(
                         app.default_window_icon()
                             .expect("应用图标应在 Tauri 配置中提供")
@@ -1264,6 +1333,7 @@ pub fn run() {
                         _ => {}
                     })
                     .build(app)?;
+                startup_metrics::record(startup_metrics::StartupStage::TrayReady);
 
                 Ok::<_, tauri::Error>(tray)
             })();
@@ -1278,6 +1348,7 @@ pub fn run() {
                     return Err(Box::new(error));
                 }
             }
+            startup_metrics::record(startup_metrics::StartupStage::AutostartChecked);
             match tray_result {
                 Ok(tray) => {
                     persistence.mark_tray_ready();
@@ -1301,8 +1372,13 @@ pub fn run() {
                             let _ = app.emit(WINDOW_LOCKED_EVENT, false);
                         }
                     }
-                    if let Err(error) = persistence.set_visible(&window, saved_visible) {
-                        eprintln!("window visibility restore failed: {error}");
+                    startup_metrics::record(startup_metrics::StartupStage::WindowStateRestored);
+                    match persistence.set_visible(&window, saved_visible) {
+                        Ok(_) if saved_visible => {
+                            startup_metrics::record(startup_metrics::StartupStage::WindowShown);
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!("window visibility restore failed: {error}"),
                     }
                 }
                 Err(error) => {
@@ -1311,10 +1387,12 @@ pub fn run() {
                         eprintln!("window unlock fallback failed: {unlock_error}");
                         return Err(Box::new(unlock_error));
                     }
+                    startup_metrics::record(startup_metrics::StartupStage::WindowStateRestored);
                     if let Err(show_error) = persistence.set_visible(&window, true) {
                         eprintln!("window show fallback failed: {show_error}");
                         return Err(Box::new(show_error));
                     }
+                    startup_metrics::record(startup_metrics::StartupStage::WindowShown);
                 }
             }
 

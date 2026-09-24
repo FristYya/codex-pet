@@ -69,7 +69,41 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
   Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+});
+
+describe("App 首屏", () => {
+  it("React 脚本执行前提供轻量加载提示，backend 未返回时仍显示桌宠", async () => {
+    const html = readFileSync("index.html", "utf8");
+    const pendingBackend = deferred<unknown>();
+    tauri.invoke.mockImplementation((command) => command === "read_window_locked"
+      ? Promise.resolve(false)
+      : pendingBackend.promise);
+
+    render(<App />);
+
+    expect(html).toContain('id="startup-placeholder"');
+    expect(html).toContain("正在读取 Codex 额度…");
+    await waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("record_react_first_frame"));
+    expect(screen.getByRole("button", { name: "展开额度详情" })).toBeInTheDocument();
+    expect(screen.getByText("正在检查 ChatGPT 连接…")).toBeInTheDocument();
+  });
+
+  it("移除窗口外层阴影并保留组件内高光", () => {
+    const styles = readFileSync("src/App.css", "utf8");
+    const rule = (selector: string) => styles.match(new RegExp(`${selector}\\s*\\{([^}]+)\\}`))?.[1] ?? "";
+    const petButton = rule("\\.pet-button");
+    const quotaCard = rule("\\.quota-card");
+    const accountCard = rule("\\.account-card");
+
+    expect(petButton).toContain("box-shadow: inset");
+    expect(petButton).not.toMatch(/box-shadow:\s*0\s/);
+    expect(quotaCard).toContain("inset 0 1px");
+    expect(quotaCard).not.toMatch(/box-shadow:\s*0\s/);
+    expect(accountCard).not.toContain("box-shadow:");
+    expect(styles).not.toContain("backdrop-filter:");
+  });
 });
 
 describe("App 额度刷新", () => {
@@ -220,7 +254,7 @@ describe("App 额度刷新", () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
 
-    expect(tauri.invoke).toHaveBeenCalledTimes(4);
+    expect(tauri.invoke.mock.calls.filter(([command]) => command === "read_quota")).toHaveLength(2);
     const quotaCalls = tauri.invoke.mock.calls.filter(([command]) => command === "read_quota");
     expect(quotaCalls[quotaCalls.length - 1]).toEqual([
       "read_quota",
@@ -236,8 +270,8 @@ describe("App 额度刷新", () => {
     await user.click(screen.getByRole("button", { name: "展开额度详情" }));
     await user.click(screen.getByRole("button", { name: "刷新额度" }));
 
-    expect(tauri.invoke).toHaveBeenCalledTimes(4);
-    expect(tauri.invoke).toHaveBeenLastCalledWith("read_quota", { source: "manual" });
+    const quotaCalls = tauri.invoke.mock.calls.filter(([command]) => command === "read_quota");
+    expect(quotaCalls[quotaCalls.length - 1]).toEqual(["read_quota", { source: "manual" }]);
   });
 
   it("手动刷新立即显示 loading，成功后恢复按钮并短暂提示成功", async () => {

@@ -1,5 +1,16 @@
 # 开发日志
 
+## 2026-09-24：启动首屏响应与窗口阴影收敛（Feature C / D）
+
+- 启动链路复核：Tauri 在 setup 前创建隐藏窗口；setup 先恢复设置、位置、Tray、Autostart 与锁定/置顶状态，再显示窗口。显示前 setup 中原生部分约 20ms；Runtime、App Server、account/read 与 quota 初始化本来就在显示后进行，并没有重复创建 App Server 或重复 quota listener 的证据。
+- 找到首屏根因：Tauri 的同步 `read_account_status` IPC 在 WebView 线程执行 Runtime 选择及 App Server `account/read`，使 React 首帧等到账户读取完成。将 `read_account_status` 和 `read_quota` 改为异步 command，并把原有同步工作交给 `spawn_blocking`；沿用原来的 AccountState 和同一个 quota coordinator，不改登录、重连、stale、single-flight 或 listener 语义。HTML 在 React 启动前提供轻量读取提示，React 随后仍即时显示原有桌宠和真实初始状态，没有占位额度或缓存伪数据。
+- 增加 opt-in 本地阶段计时：设置 `CODEX_PET_STARTUP_LOG` 后记录启动、setup、窗口创建/显示、React 首帧、Runtime 选择/就绪、account/read 和 quota 首次新鲜数据等相对毫秒时间；默认关闭，不记录账号、额度值、文件路径或 Runtime 版本。诊断日志仅保存在 `.codex-local`。
+- Windows 安装版同机前后对比：修复前 warm run 从进程启动到主窗口可见 570ms、React 首帧 3387ms、Account Runtime ready 2884ms、quota fresh 6719ms；修复后最终安装版 warm restart 分别为 496ms、554ms、2841ms、6513ms。安装后首次 cold run 可见为 1055ms，体现 Windows 冷启动与调度波动。最有因果证据的变化是 React 首帧从 3387ms 提前到 554ms（提前约 2.83 秒），因为同步 IPC 不再占住渲染线程；Runtime 和真实额度仍需后台启动时间。窗口已提前显示，但后台 runtime 初始化仍占主要启动时间。
+- 阴影排查：`tauri.conf.json` 已将原生 `shadow` 设为 `false`，未发现 `backdrop-filter`；CSS `.pet-button`、`.quota-card`、`.account-card` 有额外外投影。去除这三处外层投影，保留按钮/card 的内高光、机器人既有轮廓阴影与发光，窗口尺寸、颜色、布局、圆角和动画未改。未对 DWM 透明窗口做不可靠 hack。
+- Windows 安装版用真实窗口句柄确认主窗体可见且 164×154；程序化点击验证收起 164×154、展开 340×390、再收起正常，PrintWindow 检查两种状态及透明窗口表面。PrintWindow 不呈现窗口以外的 DWM 合成像素，因此外部真实桌面上的透明边缘观感仍需人工目视验收。锁定/Tray、always-on-top 与多显示器恢复的既有逻辑没有改动；Tray 锁定/解锁、Tray Hide/Show、拖动、DPI/多屏位置仍需人工复核。
+- 实测登录状态恢复为 `LoggedIn`，账户与 quota App Server 各一份、quota notification generation 为 1，真实 quota 读取完成且 `stale=false`。未更改认证数据、未执行登出；未登录登录流程由现有前端/Rust 回归测试覆盖，本轮未通过破坏性登出进行人工复测。
+- 自动化验证通过：Rust 117 项、Frontend 53 项、`cargo fmt -- --check`、`cargo clippy -- -D warnings`、`pnpm build`、`pnpm tauri build --bundles nsis`、`git diff --check`。Windows Release 安装版启动、账户恢复、quota 初始化以及收起/展开窗口交互已实际验证。
+
 ## 2026-09-24：v0.1.1 刷新反馈与 5 小时额度优先展示
 
 - 手动刷新立即进入 loading，禁用重复点击并显示轻量旋转指示；刷新 Promise 完成后显示成功或失败反馈，提示 2.5 秒后清除。automatic/manual 调用复用前端进行中的 Promise，未改 Rust quota coordinator、single-flight、事件或 60 秒轮询。

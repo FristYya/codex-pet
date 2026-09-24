@@ -5,10 +5,14 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tauri + React + Typescript</title>
+    <style>
+      html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+      #startup-placeholder { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 5px 9px; border: 1px solid rgba(147, 255, 217, .22); border-radius: 99px; color: #d9fff1; background: rgba(6, 21, 26, .86); font: 11px "Segoe UI", system-ui, sans-serif; white-space: nowrap; }
+    </style>
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root"><div id="startup-placeholder" role="status">正在读取 Codex 额度…</div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
