@@ -1,6 +1,6 @@
 # Codex Pet
 
-Codex Pet 是面向 Windows 的本地透明悬浮桌宠，用小窗持续显示你当前的 Codex 使用额度。它通过本机已登录的 Codex CLI App Server 获取额度；不需要另行注册 Codex Pet 账号。
+Codex Pet 是面向 Windows 的本地透明悬浮桌宠，用小窗持续显示你当前的 Codex 使用额度。它会优先复用系统中兼容且已登录的 Codex Runtime；否则使用安装包附带的官方 Runtime，并引导你通过系统浏览器登录 ChatGPT。额度由本机 App Server 读取，无需另行注册 Codex Pet 账号。
 
 Codex Pet is an independent open-source project and is not an official OpenAI product.
 
@@ -15,16 +15,17 @@ Codex Pet is an independent open-source project and is not an official OpenAI pr
 ## 系统要求
 
 - Windows 10 或 Windows 11。
-- 已安装 Codex CLI 或 Codex Desktop，并已使用你的 ChatGPT 账号完成登录。
-- 设备可正常启动 `codex app-server --stdio`。
+- 无需预装 Codex CLI，也不需要打开终端。
 
-Codex Pet 不会替你登录，也不会读取 `auth.json`、密码、Cookie 或 Token。它会优先使用 PATH 中的 Codex CLI；在 Windows 上也支持 Codex Desktop 的本机安装。若 Codex 未安装、未登录或无法读取额度，桌宠会显示不可用状态。
+Codex Pet 不会读取 `auth.json`、密码、Cookie 或 Token。若发现已有可用 Codex 登录会直接复用；否则它会使用安装包随附的官方 Codex runtime，并在桌宠中引导你通过系统浏览器登录 ChatGPT。
 
 ## 安装
 
 1. 在 [GitHub Releases](https://github.com/FristYya/codex-pet/releases) 下载最新的 Windows 安装包。
 2. 运行下载的安装程序，并按 Windows 提示完成安装。
-3. 从开始菜单启动 **Codex Pet**。桌宠会出现在屏幕上，并从本机已登录的 Codex CLI 读取额度。
+3. 从开始菜单启动 **Codex Pet**。
+4. 如果桌宠提示尚未连接 ChatGPT，点击“登录 ChatGPT”，并在系统浏览器中完成登录。
+5. 返回桌面后额度会自动显示；以后启动无需重复操作。
 
 同一版本提供两种安装包时：
 
@@ -44,12 +45,12 @@ Codex Pet 不会替你登录，也不会读取 `auth.json`、密码、Cookie 或
 
 Codex Pet 全程在本机运行：没有 Codex Pet 后端、没有遥测，也不会上传额度数据。它只向本机 Codex CLI App Server 发起额度读取请求，不会启动模型对话或发送提示词。
 
-程序不读取或保存密码、Token、Cookie、`auth.json`、会话、提示词、项目源码、账号标识或原始协议响应。
+程序不读取或保存密码、Token、Cookie、`auth.json`、会话、提示词、项目源码、账号标识或原始协议响应。Bundled runtime 的登录数据由其自身在 Codex Pet 的用户级应用数据目录管理；卸载默认保留该数据，不会影响系统 Codex 或用户项目。
 
 ## 当前限制
 
 - 目前仅支持 Windows 10/11；尚未提供完整的 macOS 适配。
-- 额度显示依赖已登录且可用的 Codex CLI，以及其 App Server 提供的额度接口。
+- 额度显示依赖可用的本地 Codex App Server；安装包会随附已验证版本的 runtime，系统已有的兼容登录可直接复用。
 - 多显示器和 DPI 恢复已具备保护逻辑，但完整的真实硬件组合仍会随 Windows、显示器和缩放设置而不同。
 - 不提供额度历史、自动更新、独立设置主窗口、额外皮肤或 Claude/Gemini 支持。
 
@@ -66,6 +67,7 @@ Codex Pet 全程在本机运行：没有 Codex Pet 后端、没有遥测，也�
 
 ```powershell
 pnpm install
+pnpm run prepare-runtime
 pnpm test --run
 pnpm build
 Set-Location src-tauri

@@ -10,6 +10,7 @@ The desktop application is built with the following direct components. Their res
 - [React](https://react.dev/) and [React DOM](https://react.dev/) — user interface rendering.
 - [Serde](https://serde.rs/) and serde_json — Rust data serialization.
 - [windows-sys](https://github.com/microsoft/windows-rs) — Windows API bindings.
+- [OpenAI Codex runtime](https://www.npmjs.com/package/@openai/codex) — bundled only in Windows release builds so Codex Pet can run the local App Server without a separately installed CLI. The pinned input is `@openai/codex@0.156.1-win32-x64`, downloaded from the official npm registry and verified against its published SHA-512 SRI (`sha512-MJyLxbBs2zzp5kbaR/99Zwe7SmbrwUkveTcT+ayYlO48V0nYh0eU+h2lalBwvC7VJ/ya/bXnUtISJfJKhGCD/g==`). It is Apache-2.0; release packages include `resources/codex-runtime/CODEX-RUNTIME-LICENSE.txt` and retain the vendor notices and license files, including the voice-resource notices supplied by that package.
 
 Build-only tooling, including TypeScript, Vite, Vitest, Testing Library, and the Tauri CLI, is also recorded in `package.json` and `pnpm-lock.yaml`.
 
@@ -39,6 +40,6 @@ The following projects were reviewed as architectural references only:
 
 - URL: https://github.com/openai/codex
 - License: Apache-2.0
-- Usage: Protocol reference for the local Codex App Server. No Codex source code is copied.
+- Usage: Protocol reference and exact, unmodified bundled App Server runtime. No Codex source code is copied into Codex Pet.
 
 All visual assets created for Codex Pet are original or must have a separately verified redistribution license before inclusion.

@@ -1,5 +1,15 @@
 # 开发日志
 
+## 2026-09-24：Bundled Runtime、登录恢复与生命周期验收
+
+- 固定官方 `@openai/codex@0.156.1-win32-x64` 包及 SHA-512 SRI；Tauri 将 Runtime 作为安装资源打包，运行时从应用 exe 相邻的 `resources/codex-runtime/bin/codex.exe` 定位。
+- 已登录兼容的系统 Runtime 优先复用；本机真机验收在系统 Runtime 不可用时使用 bundled Runtime，并为其保持稳定的应用私有 `CODEX_HOME`。登录状态通过 App Server `account/read` 判断，不读取系统或私有 `auth.json` 内容。
+- 两轮 Tray 正常退出和重启均通过：退出后桌宠及两个 App Server 进程消失；重启后无需重新登录，`LoggedIn`、真实 5H/Weekly quota、automatic refresh 和 manual refresh 均成功。两个正常退出的 quota App Server 均以退出码 0 结束；新版本日志未再出现 `0xC000013A`。
+- App Server 遇到终止类错误时单次重连、重建 quota generation 并重新订阅通知；初始化使用 15 秒期限，普通请求使用 5 秒期限。附着控制台回归测试修复前失败、修复后通过。
+- 运行时或 `account/read` 失败会呈现独立的 `unavailable` 状态，并可原地重试读取；登录通知触发的 `account/read` 错误也不再被折算成已登出或登录失败。新增 Rust 与前端回归测试。
+- bundled Runtime 的 Apache-2.0 license 现作为 `resources/codex-runtime/CODEX-RUNTIME-LICENSE.txt` 随 MSI/NSIS 资源打包；第三方说明和设计文档的 SHA-512 SRI 与构建脚本常量一致。
+- 用户在 Windows 安装版验收拖动、锁定/解锁、Hide/Show、Always on Top 和 Autostart；最终设置恢复为未锁定、始终置顶、自动启动开启。注册表启动目标核实为安装版 Release exe。系统与私有 auth 文件大小、修改时间保持不变。
+
 ## 2026-09-23：开机自动启动
 
 - 接入官方 `tauri-plugin-autostart` Rust manager（2.x）；Tray 提供“开机自动启动”勾选项，不增加前端插件，也不直接调用 Windows Registry。
