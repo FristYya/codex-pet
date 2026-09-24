@@ -3,6 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { QuotaSnapshot } from "./quota/types";
+// @ts-expect-error Node filesystem is used only by Vitest; this test is not shipped in the browser build.
+import { readFileSync } from "node:fs";
 
 const tauri = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -80,6 +82,21 @@ describe("App 额度刷新", () => {
 
     expect(await screen.findByText("尚未连接 ChatGPT")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "登录 ChatGPT" })).toBeInTheDocument();
+  });
+
+  it("首次登录入口位于收起小窗可见区域内", async () => {
+    tauri.invoke.mockImplementation((command) => Promise.resolve(
+      command === "read_window_locked" ? false : command === "read_account_status" ? "loggedOut" : snapshot,
+    ));
+
+    render(<App />);
+
+    await screen.findByRole("region", { name: "ChatGPT 登录状态" });
+    const styles = readFileSync("src/App.css", "utf8");
+    const accountCard = styles.match(/\.account-card\s*\{([^}]+)\}/)?.[1];
+    const top = Number.parseFloat(accountCard?.match(/\btop:\s*(-?\d+(?:\.\d+)?)px/)?.[1] ?? "NaN");
+    expect(Number.isFinite(top)).toBe(true);
+    expect(top).toBeLessThanOrEqual(20);
   });
 
   it("运行时不可用时提供连接重试，不提示重新登录", async () => {

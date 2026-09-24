@@ -465,9 +465,11 @@ impl AccountReader for CodexClient {
 fn read_account_login_with_reconnect<C: AccountReader>(
     client: &mut Option<C>,
     connect: &dyn Fn() -> Result<C, AdapterError>,
+    reconnected: &mut bool,
 ) -> Result<bool, AdapterError> {
     for attempt in 0..2 {
         if client.is_none() {
+            *reconnected = true;
             match connect() {
                 Ok(connected) => {
                     diagnostic("account client connected");
@@ -489,26 +491,46 @@ fn read_account_login_with_reconnect<C: AccountReader>(
             .has_chatgpt_login()
         {
             Ok(logged_in) => return Ok(logged_in),
-            Err(error) => {
+            Err(error) if account_error_requires_reconnect(&error) => {
                 diagnostic(format!(
                     "account client reconnect after account/read error={}",
                     adapter_error_kind(&error)
                 ));
+                *reconnected = true;
                 client.take();
                 if attempt == 1 {
                     return Err(error);
                 }
             }
+            Err(error) => return Err(error),
         }
     }
     unreachable!("two account reconnect attempts are bounded")
 }
 
+fn account_error_requires_reconnect(error: &AdapterError) -> bool {
+    matches!(
+        error,
+        AdapterError::Io { .. }
+            | AdapterError::Protocol { .. }
+            | AdapterError::MalformedJson
+            | AdapterError::UnexpectedChildExit
+            | AdapterError::StderrFlooding { .. }
+            | AdapterError::AlreadyShutdown
+    )
+}
+
 fn account_updated_read_result(
     machine: &mut AccountMachine,
     account_read: Result<bool, AdapterError>,
+    reconnected: bool,
 ) -> Option<(AccountStatus, bool)> {
     match account_read {
+        Ok(false) if reconnected => {
+            machine.active_login_id()?;
+            machine.unavailable();
+            Some((AccountStatus::Unavailable, false))
+        }
         Ok(false) => None,
         Ok(true) => {
             machine.active_login_id()?;
@@ -516,7 +538,7 @@ fn account_updated_read_result(
             diagnostic("account transition LoggingIn->LoggedIn via account/updated");
             Some((AccountStatus::LoggedIn, true))
         }
-        Err(error) => {
+        Err(error) if reconnected || account_error_requires_reconnect(&error) => {
             machine.active_login_id()?;
             diagnostic(format!(
                 "account updated read unavailable error={}",
@@ -524,6 +546,13 @@ fn account_updated_read_result(
             ));
             machine.unavailable();
             Some((AccountStatus::Unavailable, false))
+        }
+        Err(error) => {
+            diagnostic(format!(
+                "account updated read temporarily failed error={}",
+                adapter_error_kind(&error)
+            ));
+            None
         }
     }
 }
@@ -566,7 +595,9 @@ impl AccountState {
             .client
             .lock()
             .expect("account client mutex poisoned");
-        let account_read = read_account_login_with_reconnect(&mut client, &*self.inner.connect);
+        let mut reconnected = false;
+        let account_read =
+            read_account_login_with_reconnect(&mut client, &*self.inner.connect, &mut reconnected);
         let mut machine = self
             .inner
             .machine
@@ -577,8 +608,9 @@ impl AccountState {
             Ok(logged_in) if logged_in || previous != AccountStatus::LoggingIn => {
                 machine.reconcile(logged_in)
             }
+            Ok(false) if reconnected => machine.unavailable(),
             Ok(_) => {}
-            Err(error) if previous != AccountStatus::LoggingIn => {
+            Err(error) if previous != AccountStatus::LoggingIn || reconnected => {
                 diagnostic(format!(
                     "account status unavailable error={}",
                     adapter_error_kind(&error)
@@ -674,6 +706,7 @@ impl AccountState {
             if !active {
                 return None;
             }
+            let mut reconnected = false;
             let account_read = read_account_login_with_reconnect(
                 &mut self
                     .inner
@@ -681,13 +714,14 @@ impl AccountState {
                     .lock()
                     .expect("account client mutex poisoned"),
                 &*self.inner.connect,
+                &mut reconnected,
             );
             let mut machine = self
                 .inner
                 .machine
                 .lock()
                 .expect("account machine mutex poisoned");
-            return account_updated_read_result(&mut machine, account_read);
+            return account_updated_read_result(&mut machine, account_read, reconnected);
         }
         let login_id = notification.login_id()?;
         let accepted = {
@@ -720,6 +754,7 @@ impl AccountState {
             ));
         }
 
+        let mut reconnected = false;
         let account_read = read_account_login_with_reconnect(
             &mut self
                 .inner
@@ -727,6 +762,7 @@ impl AccountState {
                 .lock()
                 .expect("account client mutex poisoned"),
             &*self.inner.connect,
+            &mut reconnected,
         );
         let mut machine = self
             .inner
@@ -1345,10 +1381,42 @@ mod wiring_tests {
         let fresh = FakeAccountReader(Mutex::new(VecDeque::from([Ok(true)])));
         let pool = Mutex::new(VecDeque::from([Ok(fresh)]));
         let mut client = Some(old);
-        let logged_in = read_account_login_with_reconnect(&mut client, &|| {
-            pool.lock().unwrap().pop_front().unwrap()
-        });
+        let mut reconnected = false;
+        let logged_in = read_account_login_with_reconnect(
+            &mut client,
+            &|| pool.lock().unwrap().pop_front().unwrap(),
+            &mut reconnected,
+        );
         assert!(logged_in.unwrap());
+        assert!(reconnected);
+    }
+
+    #[test]
+    fn account_read_rpc_error_keeps_the_live_client_instead_of_reconnecting() {
+        let old = FakeAccountReader(Mutex::new(VecDeque::from([Err(AdapterError::Rpc {
+            code: -32000,
+            message: "temporary account/read failure".into(),
+            data: None,
+        })])));
+        let fresh = FakeAccountReader(Mutex::new(VecDeque::from([Ok(true)])));
+        let pool = Mutex::new(VecDeque::from([Ok(fresh)]));
+        let reconnect_calls = AtomicUsize::new(0);
+        let mut client = Some(old);
+
+        let mut reconnected = false;
+        let result = read_account_login_with_reconnect(
+            &mut client,
+            &|| {
+                reconnect_calls.fetch_add(1, Ordering::SeqCst);
+                pool.lock().unwrap().pop_front().unwrap()
+            },
+            &mut reconnected,
+        );
+
+        assert!(matches!(result, Err(AdapterError::Rpc { .. })));
+        assert_eq!(reconnect_calls.load(Ordering::SeqCst), 0);
+        assert!(!reconnected);
+        assert!(client.is_some());
     }
 
     #[test]
@@ -1359,10 +1427,14 @@ mod wiring_tests {
             Ok(fresh),
         ]));
         let mut client = None;
-        let logged_in = read_account_login_with_reconnect(&mut client, &|| {
-            pool.lock().unwrap().pop_front().unwrap()
-        });
+        let mut reconnected = false;
+        let logged_in = read_account_login_with_reconnect(
+            &mut client,
+            &|| pool.lock().unwrap().pop_front().unwrap(),
+            &mut reconnected,
+        );
         assert!(logged_in.unwrap());
+        assert!(reconnected);
     }
 
     #[test]
@@ -1372,10 +1444,14 @@ mod wiring_tests {
             Err(AdapterError::UnexpectedChildExit),
         ]));
         let mut client = None;
-        let result = read_account_login_with_reconnect(&mut client, &|| {
-            pool.lock().unwrap().pop_front().unwrap()
-        });
+        let mut reconnected = false;
+        let result = read_account_login_with_reconnect(
+            &mut client,
+            &|| pool.lock().unwrap().pop_front().unwrap(),
+            &mut reconnected,
+        );
         assert!(matches!(result, Err(AdapterError::UnexpectedChildExit)));
+        assert!(reconnected);
     }
 
     #[test]
@@ -1393,11 +1469,44 @@ mod wiring_tests {
         let mut machine = AccountMachine::new();
         machine.begin("login-1".into());
 
-        let outcome =
-            account_updated_read_result(&mut machine, Err(AdapterError::UnexpectedChildExit));
+        let outcome = account_updated_read_result(
+            &mut machine,
+            Err(AdapterError::UnexpectedChildExit),
+            false,
+        );
 
         assert_eq!(outcome, Some((AccountStatus::Unavailable, false)));
         assert_eq!(machine.status(), AccountStatus::Unavailable);
+    }
+
+    #[test]
+    fn account_updated_read_after_reconnect_ends_the_abandoned_login_wait() {
+        let mut machine = AccountMachine::new();
+        machine.begin("login-1".into());
+
+        let outcome = account_updated_read_result(&mut machine, Ok(false), true);
+
+        assert_eq!(outcome, Some((AccountStatus::Unavailable, false)));
+        assert_eq!(machine.active_login_id(), None);
+        assert_eq!(machine.status(), AccountStatus::Unavailable);
+    }
+
+    #[test]
+    fn account_updated_transient_read_error_keeps_the_pending_login() {
+        let mut machine = AccountMachine::new();
+        machine.begin("login-1".into());
+
+        let outcome = account_updated_read_result(
+            &mut machine,
+            Err(AdapterError::Timeout {
+                method: "account/read".into(),
+            }),
+            false,
+        );
+
+        assert_eq!(outcome, None);
+        assert_eq!(machine.active_login_id(), Some("login-1"));
+        assert_eq!(machine.status(), AccountStatus::LoggingIn);
     }
 
     #[test]
