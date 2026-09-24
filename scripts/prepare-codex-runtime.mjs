@@ -12,10 +12,15 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const cache = join(root, ".runtime-cache");
 const destination = join(root, "src-tauri", "resources", "codex-runtime");
 const license = join(root, "scripts", "licenses", "CODEX-RUNTIME-LICENSE.txt");
+const ripgrepLicense = join(root, "scripts", "licenses", "RIPGREP-LICENSE-MIT.txt");
 const archive = join(cache, "openai-codex-0.156.1-win32-x64.tgz");
 const extracted = join(cache, "package");
 
+if (process.platform !== "win32" || process.arch !== "x64") {
+  throw new Error("当前 bundled Codex Runtime 仅支持 Windows x64 构建");
+}
 if (!existsSync(license)) throw new Error("Codex runtime Apache-2.0 license file is missing");
+if (!existsSync(ripgrepLicense)) throw new Error("Bundled ripgrep MIT license file is missing");
 rmSync(cache, { recursive: true, force: true });
 mkdirSync(cache, { recursive: true });
 const npm = process.platform === "win32"
@@ -38,7 +43,9 @@ rmSync(destination, { recursive: true, force: true });
 mkdirSync(destination, { recursive: true });
 await cp(vendor, destination, { recursive: true });
 await copyFile(license, join(destination, "CODEX-RUNTIME-LICENSE.txt"));
+await copyFile(ripgrepLicense, join(destination, "RIPGREP-LICENSE-MIT.txt"));
+rmSync(join(destination, "codex-resources", "voice"), { recursive: true, force: true });
 await writeFile(join(destination, ".gitkeep"), "");
 const unexpected = readdirSync(destination).length === 0;
 if (unexpected) throw new Error("官方 runtime 提取为空");
-console.log(`已准备官方 bundled Codex runtime ${version}`);
+console.log(`已准备官方 bundled Codex runtime ${version}（不含未使用的 voice 资源）`);

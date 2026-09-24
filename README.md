@@ -17,7 +17,7 @@ Codex Pet is an independent open-source project and is not an official OpenAI pr
 - Windows 10 或 Windows 11。
 - 无需预装 Codex CLI，也不需要打开终端。
 
-Codex Pet 不会读取 `auth.json`、密码、Cookie 或 Token。若发现已有可用 Codex 登录会直接复用；否则它会使用安装包随附的官方 Codex runtime，并在桌宠中引导你通过系统浏览器登录 ChatGPT。
+Codex Pet 不提供密码、Cookie 或 Token 输入框，也不会自行解析或展示认证文件。随包的官方 Codex Runtime 会在 Codex Pet 专用的用户数据目录中管理自己的登录数据，并通过本机 App Server 使用该登录状态。若发现已有可用 Codex 登录会直接复用；否则桌宠会引导你通过系统浏览器登录 ChatGPT。
 
 ## 安装
 
@@ -43,9 +43,9 @@ Codex Pet 不会读取 `auth.json`、密码、Cookie 或 Token。若发现已有
 
 ## Local First 与隐私
 
-Codex Pet 全程在本机运行：没有 Codex Pet 后端、没有遥测，也不会上传额度数据。它只向本机 Codex CLI App Server 发起额度读取请求，不会启动模型对话或发送提示词。
+Codex Pet 全程在本机运行：没有 Codex Pet 后端、没有遥测，也不会上传额度数据。它只向本机 Codex App Server 发起额度读取请求，不会启动模型对话或发送提示词。
 
-程序不读取或保存密码、Token、Cookie、`auth.json`、会话、提示词、项目源码、账号标识或原始协议响应。Bundled runtime 的登录数据由其自身在 Codex Pet 的用户级应用数据目录管理；卸载默认保留该数据，不会影响系统 Codex 或用户项目。
+Codex Pet 的界面与 Rust 适配层不会直接读取、记录或展示密码、Token、Cookie、`auth.json` 或会话内容；随包的官方 Codex Runtime 会在专用 `CODEX_HOME` 中读取和保存其登录数据，以便 App Server 恢复登录。该目录位于 Codex Pet 的用户级应用数据目录，卸载后默认保留；它不会改动系统 Codex 或用户项目。额度请求和快照只在本机处理，没有 Codex Pet 后端或遥测，也不会上传额度数据。
 
 ## 当前限制
 
