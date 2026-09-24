@@ -91,9 +91,16 @@ pub struct ServerNotification {
     pub params: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatgptLoginStart {
+    pub login_id: String,
+    pub auth_url: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     pub request_timeout: Duration,
+    pub initialization_timeout: Duration,
     pub shutdown_grace: Duration,
     pub max_stderr_bytes: usize,
 }
@@ -102,6 +109,7 @@ impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(5),
+            initialization_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_millis(500),
             max_stderr_bytes: 64 * 1024,
         }
@@ -119,6 +127,19 @@ trait ManagedChild: Send {
 
 struct SystemChild {
     child: Child,
+    exit_reported: bool,
+}
+
+impl SystemChild {
+    fn report_exit_once(&mut self, code: i32) {
+        if !self.exit_reported {
+            crate::diagnostic(format!(
+                "app-server exited pid={} code={code}",
+                self.child.id()
+            ));
+            self.exit_reported = true;
+        }
+    }
 }
 
 impl ManagedChild for SystemChild {
@@ -147,14 +168,18 @@ impl ManagedChild for SystemChild {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(self
-            .child
-            .try_wait()?
-            .map(|status| status.code().unwrap_or(-1)))
+        let status = self.child.try_wait()?;
+        let code = status.map(|status| status.code().unwrap_or(-1));
+        if let Some(code) = code {
+            self.report_exit_once(code);
+        }
+        Ok(code)
     }
 
     fn wait(&mut self) -> io::Result<i32> {
-        Ok(self.child.wait()?.code().unwrap_or(-1))
+        let code = self.child.wait()?.code().unwrap_or(-1);
+        self.report_exit_once(code);
+        Ok(code)
     }
 
     fn kill(&mut self) -> io::Result<()> {
@@ -332,11 +357,19 @@ impl CodexClient {
     pub fn connect(options: ClientOptions) -> Result<Self, AdapterError> {
         let executable = locate_codex()?;
         verify_codex(&executable, options.request_timeout)?;
+        Self::connect_with_runtime(options, executable, None)
+    }
+
+    pub fn connect_with_runtime(
+        options: ClientOptions,
+        executable: PathBuf,
+        codex_home: Option<PathBuf>,
+    ) -> Result<Self, AdapterError> {
         ensure_reaper().map_err(|error| AdapterError::Io {
             operation: "start resource reaper",
             reason: error.to_string(),
         })?;
-        let child = spawn_app_server(&executable)?;
+        let child = spawn_app_server(&executable, codex_home.as_deref())?;
         Self::start_with_child(Box::new(child), options)
     }
 
@@ -475,7 +508,7 @@ impl CodexClient {
             options,
         };
 
-        let initialize_result = client.request(
+        let initialize_result = client.request_with_timeout(
             "initialize",
             json!({
                 "clientInfo": {
@@ -484,6 +517,7 @@ impl CodexClient {
                 },
                 "capabilities": {}
             }),
+            client.options.initialization_timeout,
         );
         if let Err(error) = initialize_result {
             let _ = client.shutdown();
@@ -500,6 +534,40 @@ impl CodexClient {
         self.request("account/rateLimits/read", json!({}))
     }
 
+    pub fn read_account(&self) -> Result<Value, AdapterError> {
+        self.request("account/read", json!({}))
+    }
+
+    pub fn has_chatgpt_login(&self) -> Result<bool, AdapterError> {
+        let account = self.read_account()?;
+        Ok(account_has_chatgpt_login(&account))
+    }
+
+    pub fn start_chatgpt_login(&self) -> Result<ChatgptLoginStart, AdapterError> {
+        let result = self.request("account/login/start", json!({ "type": "chatgpt" }))?;
+        let login_id = result
+            .get("loginId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AdapterError::Protocol {
+                reason: "account/login/start response is missing loginId".into(),
+            })?;
+        let auth_url = result
+            .get("authUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AdapterError::Protocol {
+                reason: "account/login/start response is missing authUrl".into(),
+            })?;
+        Ok(ChatgptLoginStart {
+            login_id: login_id.into(),
+            auth_url: auth_url.into(),
+        })
+    }
+
+    pub fn cancel_chatgpt_login(&self, login_id: &str) -> Result<(), AdapterError> {
+        self.request("account/login/cancel", json!({ "loginId": login_id }))?;
+        Ok(())
+    }
+
     pub fn take_notification_receiver(&self) -> Option<Receiver<ServerNotification>> {
         self.notification_receiver
             .lock()
@@ -508,12 +576,21 @@ impl CodexClient {
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
+        self.request_with_timeout(method, params, self.options.request_timeout)
+    }
+
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, AdapterError> {
         if self.state.shutdown.load(Ordering::Acquire) {
             return Err(AdapterError::AlreadyShutdown);
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + self.options.request_timeout;
+        let deadline = Instant::now() + timeout;
         let (sender, receiver) = mpsc::channel();
         self.state.register_pending(id, sender)?;
 
@@ -536,6 +613,9 @@ impl CodexClient {
         match receiver.recv_timeout(remaining) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                crate::diagnostic(format!(
+                    "app-server request timed out method={method} id={id}"
+                ));
                 self.state
                     .pending
                     .lock()
@@ -669,6 +749,7 @@ impl CodexClient {
                 }
             }
             if !exited {
+                crate::diagnostic("app-server termination requested reason=shutdown_deadline");
                 match child_ref.kill() {
                     Ok(()) => {
                         while Instant::now() < deadline {
@@ -818,6 +899,10 @@ impl CodexClient {
     fn has_child_handle(&self) -> bool {
         self.child.lock().expect("child mutex poisoned").is_some()
     }
+}
+
+fn account_has_chatgpt_login(account: &Value) -> bool {
+    account.pointer("/account/type").and_then(Value::as_str) == Some("chatgpt")
 }
 
 fn write_stdin(
@@ -970,6 +1055,7 @@ fn read_stdout(stdout: Box<dyn Read + Send>, state: Arc<ClientState>) {
         match reader.read_line(&mut line) {
             Ok(0) => {
                 if !state.shutdown.load(Ordering::Acquire) {
+                    crate::diagnostic("app-server stdout EOF before shutdown");
                     state.fail(AdapterError::UnexpectedChildExit);
                 }
                 return;
@@ -978,17 +1064,26 @@ fn read_stdout(stdout: Box<dyn Read + Send>, state: Arc<ClientState>) {
                 let value = match serde_json::from_str::<Value>(&line) {
                     Ok(value) => value,
                     Err(_) => {
+                        crate::diagnostic("app-server stdout malformed JSON");
                         state.fail(AdapterError::MalformedJson);
                         return;
                     }
                 };
                 if let Err(error) = dispatch_message(&state, value) {
+                    crate::diagnostic(format!(
+                        "app-server protocol failure error={}",
+                        crate::adapter_error_kind(&error)
+                    ));
                     state.fail(error);
                     return;
                 }
             }
             Err(error) => {
                 if !state.shutdown.load(Ordering::Acquire) {
+                    crate::diagnostic(format!(
+                        "app-server stdout read failed error_kind={}",
+                        error.kind()
+                    ));
                     state.fail(AdapterError::Io {
                         operation: "read child stdout",
                         reason: error.to_string(),
@@ -1001,9 +1096,9 @@ fn read_stdout(stdout: Box<dyn Read + Send>, state: Arc<ClientState>) {
 }
 
 fn dispatch_message(state: &ClientState, value: Value) -> Result<(), AdapterError> {
-    if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
+    if value.get("jsonrpc").is_some_and(|version| version != "2.0") {
         return Err(AdapterError::Protocol {
-            reason: "message is missing jsonrpc=2.0".into(),
+            reason: "message has an unsupported jsonrpc version".into(),
         });
     }
 
@@ -1073,7 +1168,14 @@ fn dispatch_message(state: &ClientState, value: Value) -> Result<(), AdapterErro
             .ok_or_else(|| AdapterError::Protocol {
                 reason: "notification is missing a method".into(),
             })?;
-    if matches!(method, "account/rateLimits/updated" | "account/updated") {
+    if matches!(
+        method,
+        "account/rateLimits/updated"
+            | "account/updated"
+            | "account/login/completed"
+            | "account/login/failed"
+            | "account/login/cancelled"
+    ) {
         let notification = ServerNotification {
             method: method.to_owned(),
             params: value.get("params").cloned().unwrap_or(Value::Null),
@@ -1168,14 +1270,15 @@ fn find_codex_in_desktop_installation(local_app_data: &Path) -> Result<PathBuf, 
             if !canonical.starts_with(&installation_root) {
                 return None;
             }
-            let modified = candidate.metadata().and_then(|metadata| metadata.modified()).ok();
+            let modified = candidate
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok();
             Some((canonical, modified))
         })
         .collect();
     candidates.sort_by(|(path_a, modified_a), (path_b, modified_b)| {
-        modified_b
-            .cmp(modified_a)
-            .then_with(|| path_b.cmp(path_a))
+        modified_b.cmp(modified_a).then_with(|| path_b.cmp(path_a))
     });
     candidates
         .into_iter()
@@ -1193,6 +1296,7 @@ struct VerificationExit {
 trait VerificationChild {
     fn try_wait(&mut self) -> io::Result<Option<VerificationExit>>;
     fn kill(&mut self) -> io::Result<()>;
+    fn take_stdout(&mut self) -> io::Result<Vec<u8>>;
 }
 
 struct SystemVerificationChild {
@@ -1210,13 +1314,24 @@ impl VerificationChild for SystemVerificationChild {
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
+
+    fn take_stdout(&mut self) -> io::Result<Vec<u8>> {
+        let stdout = self
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("version stdout was not piped"))?;
+        let mut bytes = Vec::new();
+        stdout.take(4097).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
-fn verify_codex(executable: &Path, timeout: Duration) -> Result<(), AdapterError> {
+fn verify_codex(executable: &Path, timeout: Duration) -> Result<String, AdapterError> {
     let child = Command::new(executable)
         .arg(VERSION_ARG)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| AdapterError::VersionCheckFailed {
@@ -1228,11 +1343,30 @@ fn verify_codex(executable: &Path, timeout: Duration) -> Result<(), AdapterError
 fn verify_spawned_codex(
     mut child: Box<dyn VerificationChild>,
     timeout: Duration,
-) -> Result<(), AdapterError> {
+) -> Result<String, AdapterError> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success => return Ok(()),
+            Ok(Some(status)) if status.success => {
+                let output =
+                    child
+                        .take_stdout()
+                        .map_err(|error| AdapterError::VersionCheckFailed {
+                            reason: error.to_string(),
+                        })?;
+                if output.len() > 4096 {
+                    return Err(AdapterError::VersionCheckFailed {
+                        reason: "version output exceeded the 4096-byte limit".into(),
+                    });
+                }
+                let version = String::from_utf8_lossy(&output).trim().to_owned();
+                if !crate::runtime::is_compatible(&version) {
+                    return Err(AdapterError::VersionCheckFailed {
+                        reason: "system Codex version is incompatible".into(),
+                    });
+                }
+                return Ok(version);
+            }
             Ok(Some(status)) => {
                 return Err(AdapterError::VersionCheckFailed {
                     reason: format!("process exited with code {:?}", status.code),
@@ -1266,8 +1400,19 @@ fn terminate_verification_child(child: &mut dyn VerificationChild, deadline: Ins
     }
 }
 
-fn spawn_app_server(executable: &Path) -> Result<SystemChild, AdapterError> {
-    let child = Command::new(executable)
+fn spawn_app_server(
+    executable: &Path,
+    codex_home: Option<&Path>,
+) -> Result<SystemChild, AdapterError> {
+    let mut command = Command::new(executable);
+    configure_app_server_process(&mut command);
+    if let Some(codex_home) = codex_home {
+        std::fs::create_dir_all(codex_home).map_err(|error| AdapterError::SpawnFailed {
+            reason: error.to_string(),
+        })?;
+        command.env("CODEX_HOME", codex_home);
+    }
+    let child = command
         .args(APP_SERVER_ARGS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1276,8 +1421,31 @@ fn spawn_app_server(executable: &Path) -> Result<SystemChild, AdapterError> {
         .map_err(|error| AdapterError::SpawnFailed {
             reason: error.to_string(),
         })?;
-    Ok(SystemChild { child })
+    crate::diagnostic(format!(
+        "app-server spawned pid={} exe={} CODEX_HOME={}",
+        child.id(),
+        executable.display(),
+        codex_home.map_or_else(
+            || "<inherited>".to_string(),
+            |home| home.display().to_string()
+        )
+    ));
+    Ok(SystemChild {
+        child,
+        exit_reported: false,
+    })
 }
+
+#[cfg(windows)]
+fn configure_app_server_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_app_server_process(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
@@ -1298,6 +1466,52 @@ mod tests {
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+    #[cfg(windows)]
+    #[test]
+    fn app_server_process_does_not_inherit_parent_console() {
+        const PROBE_ENV: &str = "CODEX_PET_CONSOLE_PROBE";
+        if env::var_os(PROBE_ENV).is_some() {
+            let child_console = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+            let has_console = !child_console.is_null();
+            if has_console {
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        let parent_console_before =
+            unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+        let allocated_console = if parent_console_before.is_null() {
+            if unsafe { windows_sys::Win32::System::Console::AllocConsole() } == 0 {
+                return;
+            }
+            true
+        } else {
+            false
+        };
+
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "codex_adapter::tests::app_server_process_does_not_inherit_parent_console",
+            ])
+            .env(PROBE_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_app_server_process(&mut command);
+        let output = command.output().unwrap();
+        if allocated_console {
+            unsafe { windows_sys::Win32::System::Console::FreeConsole() };
+        }
+        assert!(
+            output.status.success(),
+            "app-server child inherited its parent's console"
+        );
+    }
 
     #[derive(Default)]
     struct FakeProcessState {
@@ -1704,9 +1918,29 @@ mod tests {
     fn options() -> ClientOptions {
         ClientOptions {
             request_timeout: Duration::from_millis(200),
+            initialization_timeout: Duration::from_millis(200),
             shutdown_grace: Duration::from_millis(100),
             max_stderr_bytes: 32,
         }
+    }
+
+    #[test]
+    fn initialization_uses_its_startup_timeout_independent_of_rpc_timeout() {
+        let (child, server, _) = fake_process(true);
+        let handle = thread::spawn(move || {
+            let request = server.recv_json();
+            assert_eq!(request["method"], "initialize");
+            thread::sleep(Duration::from_millis(250));
+            server
+                .send_json(json!({"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"fake"}}}));
+            assert_eq!(server.recv_json()["method"], "initialized");
+        });
+        let mut test_options = options();
+        test_options.request_timeout = Duration::from_millis(100);
+        test_options.initialization_timeout = Duration::from_millis(500);
+        let client = CodexClient::start_with_child(child, test_options).unwrap();
+        drop(client);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1855,6 +2089,43 @@ mod tests {
     }
 
     #[test]
+    fn forwards_login_completion_notification() {
+        let (child, server, _) = fake_process(true);
+        let handle = thread::spawn(move || {
+            server.initialize();
+            server.send_json(json!({
+                "jsonrpc": "2.0",
+                "method": "account/login/completed",
+                "params": {"loginId": "login-123"}
+            }));
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let client = CodexClient::start_with_child(child, options()).unwrap();
+        let notifications = client.take_notification_receiver().unwrap();
+        assert_eq!(
+            notifications.recv_timeout(TEST_TIMEOUT).unwrap().method,
+            "account/login/completed"
+        );
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn account_read_identifies_chatgpt_from_account_type() {
+        assert!(account_has_chatgpt_login(&json!({
+            "account": {"type": "chatgpt", "email": "example@example.com"},
+            "requiresOpenaiAuth": true
+        })));
+        assert!(!account_has_chatgpt_login(
+            &json!({"account": null, "requiresOpenaiAuth": true})
+        ));
+        assert!(!account_has_chatgpt_login(
+            &json!({"account": {"type": "apiKey"}})
+        ));
+    }
+
+    #[test]
     fn bounds_stderr_and_surfaces_flooding_without_retaining_contents() {
         let (child, mut server, _) = fake_process(true);
         let stderr = server.stderr.take().unwrap();
@@ -1957,7 +2228,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let directory = temp.join("OpenAI").join("Codex").join("bin").join("current");
+        let directory = temp
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("current");
         std::fs::create_dir_all(&directory).unwrap();
         let executable = directory.join(if cfg!(windows) { "codex.exe" } else { "codex" });
         std::fs::write(&executable, []).unwrap();
@@ -2164,6 +2439,44 @@ mod tests {
         dropped: AtomicBool,
     }
 
+    struct SuccessfulVersionVerificationChild(&'static [u8]);
+
+    impl VerificationChild for SuccessfulVersionVerificationChild {
+        fn try_wait(&mut self) -> io::Result<Option<VerificationExit>> {
+            Ok(Some(VerificationExit {
+                success: true,
+                code: Some(0),
+            }))
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn take_stdout(&mut self) -> io::Result<Vec<u8>> {
+            Ok(self.0.to_vec())
+        }
+    }
+
+    #[test]
+    fn version_verification_returns_the_bounded_command_output() {
+        let output = verify_spawned_codex(
+            Box::new(SuccessfulVersionVerificationChild(b"codex 0.156.1")),
+            Duration::from_secs(1),
+        );
+        assert_eq!(output.unwrap(), "codex 0.156.1");
+    }
+
+    #[test]
+    fn version_verification_rejects_an_incompatible_command_output() {
+        let error = verify_spawned_codex(
+            Box::new(SuccessfulVersionVerificationChild(b"codex 0.100.0")),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AdapterError::VersionCheckFailed { .. }));
+    }
+
     struct TryWaitFailingVerificationChild {
         state: Arc<VerificationProcessState>,
     }
@@ -2182,6 +2495,10 @@ mod tests {
         fn kill(&mut self) -> io::Result<()> {
             self.state.killed.store(true, Ordering::SeqCst);
             Ok(())
+        }
+
+        fn take_stdout(&mut self) -> io::Result<Vec<u8>> {
+            Ok(Vec::new())
         }
     }
 
@@ -2211,8 +2528,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_jsonrpc_and_invalid_response_envelopes() {
-        let missing_version = dispatch_message(&protocol_test_state(), json!({"id":1,"result":{}}));
+    fn rejects_invalid_jsonrpc_and_invalid_response_envelopes() {
+        let missing_version = dispatch_message(
+            &protocol_test_state(),
+            json!({"jsonrpc":"1.0","id":1,"result":{}}),
+        );
         assert!(matches!(
             missing_version,
             Err(AdapterError::Protocol { .. })
@@ -2239,6 +2559,32 @@ mod tests {
             json!({"jsonrpc":"2.0","id":99,"method":"server/call","params":{}}),
         );
         assert!(matches!(server_request, Err(AdapterError::Protocol { .. })));
+    }
+
+    #[test]
+    fn accepts_bundled_runtime_messages_without_jsonrpc_field() {
+        let state = protocol_test_state();
+        let (response_sender, response_receiver) = mpsc::channel();
+        state.register_pending(1, response_sender).unwrap();
+
+        dispatch_message(
+            &state,
+            json!({"id":1,"result":{"serverInfo":{"name":"codex"}}}),
+        )
+        .unwrap();
+        assert_eq!(
+            response_receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap()
+                .unwrap()["serverInfo"]["name"],
+            "codex"
+        );
+
+        dispatch_message(
+            &state,
+            json!({"method":"account/updated","params":{},"emittedAtMs":1}),
+        )
+        .unwrap();
     }
 
     #[test]

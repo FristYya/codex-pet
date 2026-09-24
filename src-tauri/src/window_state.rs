@@ -1338,8 +1338,8 @@ mod tests {
         let tray = FakeTray::with_checked(AUTOSTART_MENU_ID, false);
         tray.fail_next_write.set(true);
 
-        let result = WindowStateController::new(&mut state)
-            .reconcile_autostart(&autostart, Some(&tray));
+        let result =
+            WindowStateController::new(&mut state).reconcile_autostart(&autostart, Some(&tray));
 
         assert!(result.is_err());
         assert!(!state.persisted_settings().autostart);

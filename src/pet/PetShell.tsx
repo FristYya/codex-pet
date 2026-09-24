@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { QuotaSnapshot } from "../quota/types";
+import type { AccountStatus } from "../account/types";
 
 type PetShellProps = {
   snapshot: QuotaSnapshot;
+  accountStatus?: AccountStatus;
   locked?: boolean;
   onExpandedChange: (expanded: boolean) => void;
   onStartDragging?: () => void;
   onRefresh: () => void;
+  onRetryAccountStatus?: () => void;
+  onStartChatgptLogin?: () => void;
+  onCancelChatgptLogin?: () => void;
 };
 
 const AUTO_COLLAPSE_MS = 800;
@@ -47,7 +52,17 @@ function resetLabel(resetsAt: number | null) {
   return `重置于 ${remainder}M`;
 }
 
-export function PetShell({ snapshot, locked = false, onExpandedChange, onStartDragging, onRefresh }: PetShellProps) {
+export function PetShell({
+  snapshot,
+  accountStatus = "loggedIn",
+  locked = false,
+  onExpandedChange,
+  onStartDragging,
+  onRefresh,
+  onRetryAccountStatus,
+  onStartChatgptLogin,
+  onCancelChatgptLogin,
+}: PetShellProps) {
   const [expanded, setExpanded] = useState(false);
   const collapseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -121,6 +136,18 @@ export function PetShell({ snapshot, locked = false, onExpandedChange, onStartDr
   };
   const cancelCollapse = () => { if (collapseTimer.current) clearTimeout(collapseTimer.current); };
   const headline = tightestWindow ? `${Math.round(tightestWindow.remainingPercent)}%` : snapshot.availability === "blocked" ? "已暂停" : "额度暂不可用";
+  const needsLogin = accountStatus !== "loggedIn";
+  const accountCard = accountStatus === "loggingIn"
+    ? { title: "正在等待浏览器登录…", action: "取消", onAction: onCancelChatgptLogin }
+    : accountStatus === "unavailable"
+      ? { title: "无法连接 Codex Runtime", action: "重试连接", onAction: onRetryAccountStatus }
+    : accountStatus === "loginFailed"
+      ? { title: "登录未完成，请重试", action: "重新登录", onAction: onStartChatgptLogin }
+      : accountStatus === "cancelled"
+        ? { title: "已取消登录", action: "登录 ChatGPT", onAction: onStartChatgptLogin }
+        : accountStatus === "checking"
+          ? { title: "正在检查 ChatGPT 连接…", action: null, onAction: undefined }
+          : { title: "尚未连接 ChatGPT", action: "登录 ChatGPT", onAction: onStartChatgptLogin };
 
   return (
     <main className={`pet-shell pet-${snapshot.availability}${expanded ? " is-expanded" : ""}${locked ? " is-locked" : ""}`} onPointerEnter={cancelCollapse} onPointerLeave={scheduleCollapse}>
@@ -154,7 +181,11 @@ export function PetShell({ snapshot, locked = false, onExpandedChange, onStartDr
         <PetFace availability={snapshot.availability} />
         <span className="quota-pill">{headline}</span>
       </button>
-      {expanded && <section className="quota-card" aria-label="Codex 额度详情">
+      {needsLogin ? <section className="account-card" aria-label="ChatGPT 登录状态">
+        <p className="eyebrow">CODEX PET</p>
+        <strong>{accountCard.title}</strong>
+        {accountCard.action && <button type="button" onClick={accountCard.onAction}>{accountCard.action}</button>}
+      </section> : expanded && <section className="quota-card" aria-label="Codex 额度详情">
         <header><div><p className="eyebrow">CODEX PET</p><h1>额度状态</h1></div><span className={`status-dot status-${snapshot.availability}`}>{snapshot.stale ? "更新失败" : "本机读取"}</span></header>
         {snapshot.windows.length ? <div className="quota-list">{snapshot.windows.map((window) => <article className="quota-row" key={window.id}>
           <div className="quota-row-heading"><strong>{window.name}</strong><span>{Math.round(window.remainingPercent)}% 剩余</span></div>

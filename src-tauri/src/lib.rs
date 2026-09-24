@@ -1,3 +1,4 @@
+use account::{AccountMachine, AccountStatus, LoginNotification};
 use codex_adapter::{AdapterError, CodexClient, ServerNotification};
 use quota::{QuotaRefreshCoordinator, QuotaSnapshot, spawn_notification_bridge};
 use serde_json::Value;
@@ -16,18 +17,45 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 use tauri_plugin_autostart::{AutoLaunchManager, ManagerExt as AutostartManagerExt};
+use tauri_plugin_opener::OpenerExt;
 use window_state::{
     AUTOSTART_MENU_ID, AutostartControl, LOCKED_MENU_ID, MonitorContext, MonitorProvider,
     NativeWindow, RuntimeWindowState, TOPMOST_MENU_ID, TrayState, WindowOperationError,
     WindowOperationResult, WindowStateController, resolve_monitor, resolve_startup_monitor_for,
 };
 
+pub mod account;
+
 const WINDOW_LOCKED_EVENT: &str = "window://locked";
+const ACCOUNT_UPDATED_EVENT: &str = "account://updated";
 
 pub mod codex_adapter;
 pub mod quota;
+pub mod runtime;
 pub mod settings;
 pub mod window_state;
+
+pub(crate) fn diagnostic(message: impl std::fmt::Display) {
+    if std::env::var_os("CODEX_PET_DIAGNOSTICS").is_some() {
+        eprintln!("[codex-pet] {message}");
+    }
+}
+
+pub(crate) fn adapter_error_kind(error: &AdapterError) -> &'static str {
+    match error {
+        AdapterError::ExecutableNotFound => "executable_not_found",
+        AdapterError::VersionCheckFailed { .. } => "version_check_failed",
+        AdapterError::SpawnFailed { .. } => "spawn_failed",
+        AdapterError::Io { .. } => "io",
+        AdapterError::Protocol { .. } => "protocol",
+        AdapterError::MalformedJson => "malformed_json",
+        AdapterError::Rpc { .. } => "rpc",
+        AdapterError::Timeout { .. } => "timeout",
+        AdapterError::UnexpectedChildExit => "unexpected_child_exit",
+        AdapterError::StderrFlooding { .. } => "stderr_flooding",
+        AdapterError::AlreadyShutdown => "already_shutdown",
+    }
+}
 
 struct TauriMonitorProvider<'a, R: tauri::Runtime> {
     window: &'a tauri::Window<R>,
@@ -410,11 +438,309 @@ fn spawn_persistence_scheduler(
 struct AppState {
     coordinator: Arc<QuotaRefreshCoordinator>,
     shutdown: Box<dyn Fn() + Send + Sync>,
+    reset: Box<dyn Fn() + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct AccountState {
+    inner: Arc<AccountInner>,
+}
+
+struct AccountInner {
+    machine: Mutex<AccountMachine>,
+    client: Mutex<Option<CodexClient>>,
+    connect: Box<dyn Fn() -> Result<CodexClient, AdapterError> + Send + Sync>,
+}
+
+trait AccountReader {
+    fn has_chatgpt_login(&self) -> Result<bool, AdapterError>;
+}
+
+impl AccountReader for CodexClient {
+    fn has_chatgpt_login(&self) -> Result<bool, AdapterError> {
+        CodexClient::has_chatgpt_login(self)
+    }
+}
+
+fn read_account_login_with_reconnect<C: AccountReader>(
+    client: &mut Option<C>,
+    connect: &dyn Fn() -> Result<C, AdapterError>,
+) -> Result<bool, AdapterError> {
+    for attempt in 0..2 {
+        if client.is_none() {
+            match connect() {
+                Ok(connected) => {
+                    diagnostic("account client connected");
+                    *client = Some(connected);
+                }
+                Err(error) if attempt == 0 => {
+                    diagnostic(format!(
+                        "account connect retry error={}",
+                        adapter_error_kind(&error)
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        match client
+            .as_ref()
+            .expect("connected account client")
+            .has_chatgpt_login()
+        {
+            Ok(logged_in) => return Ok(logged_in),
+            Err(error) => {
+                diagnostic(format!(
+                    "account client reconnect after account/read error={}",
+                    adapter_error_kind(&error)
+                ));
+                client.take();
+                if attempt == 1 {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    unreachable!("two account reconnect attempts are bounded")
+}
+
+fn account_updated_read_result(
+    machine: &mut AccountMachine,
+    account_read: Result<bool, AdapterError>,
+) -> Option<(AccountStatus, bool)> {
+    match account_read {
+        Ok(false) => None,
+        Ok(true) => {
+            machine.active_login_id()?;
+            machine.reconcile(true);
+            diagnostic("account transition LoggingIn->LoggedIn via account/updated");
+            Some((AccountStatus::LoggedIn, true))
+        }
+        Err(error) => {
+            machine.active_login_id()?;
+            diagnostic(format!(
+                "account updated read unavailable error={}",
+                adapter_error_kind(&error)
+            ));
+            machine.unavailable();
+            Some((AccountStatus::Unavailable, false))
+        }
+    }
+}
+
+fn login_completed_read_result(
+    machine: &mut AccountMachine,
+    account_read: Result<bool, AdapterError>,
+) -> (AccountStatus, bool) {
+    match account_read {
+        Ok(true) => machine.reconcile(true),
+        Ok(false) => machine.fail(),
+        Err(error) => {
+            diagnostic(format!(
+                "account login confirmation read unavailable error={}",
+                adapter_error_kind(&error)
+            ));
+            machine.unavailable();
+        }
+    }
+    let status = machine.status();
+    diagnostic(format!("account login notification transition={status:?}"));
+    (status, status == AccountStatus::LoggedIn)
+}
+
+impl AccountState {
+    fn new(
+        connect: impl Fn() -> Result<CodexClient, AdapterError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(AccountInner {
+                machine: Mutex::new(AccountMachine::new()),
+                client: Mutex::new(None),
+                connect: Box::new(connect),
+            }),
+        }
+    }
+    fn status(&self) -> (AccountStatus, bool) {
+        let mut client = self
+            .inner
+            .client
+            .lock()
+            .expect("account client mutex poisoned");
+        let account_read = read_account_login_with_reconnect(&mut client, &*self.inner.connect);
+        let mut machine = self
+            .inner
+            .machine
+            .lock()
+            .expect("account machine mutex poisoned");
+        let previous = machine.status();
+        match account_read {
+            Ok(logged_in) if logged_in || previous != AccountStatus::LoggingIn => {
+                machine.reconcile(logged_in)
+            }
+            Ok(_) => {}
+            Err(error) if previous != AccountStatus::LoggingIn => {
+                diagnostic(format!(
+                    "account status unavailable error={}",
+                    adapter_error_kind(&error)
+                ));
+                machine.unavailable();
+            }
+            Err(error) => diagnostic(format!(
+                "account status unavailable during login error={}",
+                adapter_error_kind(&error)
+            )),
+        }
+        let status = machine.status();
+        diagnostic(format!("account transition {:?}->{:?}", previous, status));
+        (
+            status,
+            previous != AccountStatus::LoggedIn && status == AccountStatus::LoggedIn,
+        )
+    }
+    fn start<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+    ) -> Result<(AccountStatus, Option<Receiver<ServerNotification>>), String> {
+        let mut client = self
+            .inner
+            .client
+            .lock()
+            .map_err(|_| "account client mutex poisoned")?;
+        if client.is_none() {
+            *client = Some((self.inner.connect)().map_err(|error| error.to_string())?);
+        }
+        let login = client
+            .as_ref()
+            .expect("account client")
+            .start_chatgpt_login()
+            .map_err(|error| error.to_string())?;
+        self.inner
+            .machine
+            .lock()
+            .map_err(|_| "account machine mutex poisoned")?
+            .begin(login.login_id.clone());
+        if let Err(error) = app.opener().open_url(login.auth_url, None::<String>) {
+            let _ = client
+                .as_ref()
+                .expect("account client")
+                .cancel_chatgpt_login(&login.login_id);
+            self.inner
+                .machine
+                .lock()
+                .map_err(|_| "account machine mutex poisoned")?
+                .fail();
+            return Err(error.to_string());
+        }
+        let notifications = client
+            .as_ref()
+            .expect("account client")
+            .take_notification_receiver();
+        Ok((AccountStatus::LoggingIn, notifications))
+    }
+    fn cancel(&self) -> Result<AccountStatus, String> {
+        let client = self
+            .inner
+            .client
+            .lock()
+            .map_err(|_| "account client mutex poisoned")?;
+        let mut machine = self
+            .inner
+            .machine
+            .lock()
+            .map_err(|_| "account machine mutex poisoned")?;
+        let Some(login_id) = machine.active_login_id().map(str::to_owned) else {
+            return Ok(machine.status());
+        };
+        if let Some(client) = client.as_ref() {
+            client
+                .cancel_chatgpt_login(&login_id)
+                .map_err(|error| error.to_string())?;
+        }
+        machine.cancel(&login_id);
+        Ok(machine.status())
+    }
+    fn handle_login_notification(
+        &self,
+        notification: LoginNotification,
+    ) -> Option<(AccountStatus, bool)> {
+        if notification == LoginNotification::AccountUpdated {
+            let active = self
+                .inner
+                .machine
+                .lock()
+                .expect("account machine mutex poisoned")
+                .active_login_id()
+                .is_some();
+            if !active {
+                return None;
+            }
+            let account_read = read_account_login_with_reconnect(
+                &mut self
+                    .inner
+                    .client
+                    .lock()
+                    .expect("account client mutex poisoned"),
+                &*self.inner.connect,
+            );
+            let mut machine = self
+                .inner
+                .machine
+                .lock()
+                .expect("account machine mutex poisoned");
+            return account_updated_read_result(&mut machine, account_read);
+        }
+        let login_id = notification.login_id()?;
+        let accepted = {
+            let mut machine = self
+                .inner
+                .machine
+                .lock()
+                .expect("account machine mutex poisoned");
+            match &notification {
+                LoginNotification::Completed { .. } => machine.complete(login_id, true),
+                LoginNotification::Failed { .. } => machine.complete(login_id, false),
+                LoginNotification::Cancelled { .. } => machine.cancel(login_id),
+                LoginNotification::AccountUpdated => {
+                    unreachable!("handled before login ID matching")
+                }
+            }
+        };
+        if !accepted {
+            return None;
+        }
+
+        if !matches!(notification, LoginNotification::Completed { .. }) {
+            return Some((
+                self.inner
+                    .machine
+                    .lock()
+                    .expect("account machine mutex poisoned")
+                    .status(),
+                false,
+            ));
+        }
+
+        let account_read = read_account_login_with_reconnect(
+            &mut self
+                .inner
+                .client
+                .lock()
+                .expect("account client mutex poisoned"),
+            &*self.inner.connect,
+        );
+        let mut machine = self
+            .inner
+            .machine
+            .lock()
+            .expect("account machine mutex poisoned");
+        Some(login_completed_read_result(&mut machine, account_read))
+    }
 }
 
 struct ClientSession<C> {
     client: Option<C>,
     stopped: bool,
+    generation: u64,
 }
 
 trait QuotaClient: Send + 'static {
@@ -446,7 +772,9 @@ impl AppState {
         let session = Arc::new(Mutex::new(ClientSession::<C> {
             client: None,
             stopped: false,
+            generation: 0,
         }));
+        let reset_session = Arc::clone(&session);
         let emitter = Arc::new(Mutex::new(Some(emit)));
         let read_session = Arc::clone(&session);
         let active_emitter = Arc::clone(&emitter);
@@ -458,35 +786,70 @@ impl AppState {
                     if session.stopped {
                         return Err(AdapterError::AlreadyShutdown);
                     }
-                    let client = &mut session.client;
-                    if client.is_none() {
-                        let connected = connect()?;
-                        if let Some(notifications) = connected.take_notification_receiver()
-                            && let Some(coordinator) = coordinator.upgrade()
-                        {
-                            spawn_notification_bridge(notifications, coordinator);
+                    for attempt in 0..2 {
+                        if session.client.is_none() {
+                            let connected = match connect() {
+                                Ok(connected) => connected,
+                                Err(error) if attempt == 0 => {
+                                    diagnostic(format!(
+                                        "quota connect retry error={}",
+                                        adapter_error_kind(&error)
+                                    ));
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            session.generation += 1;
+                            diagnostic(format!(
+                                "quota client connected generation={}",
+                                session.generation
+                            ));
+                            if let Some(notifications) = connected.take_notification_receiver()
+                                && let Some(coordinator) = coordinator.upgrade()
+                            {
+                                diagnostic(format!(
+                                    "quota notifications subscribed generation={}",
+                                    session.generation
+                                ));
+                                spawn_notification_bridge(notifications, coordinator);
+                            }
+                            session.client = Some(connected);
                         }
-                        *client = Some(connected);
+                        diagnostic(format!("quota refresh generation={}", session.generation));
+                        let result = session
+                            .client
+                            .as_ref()
+                            .expect("connected client")
+                            .read_rate_limits();
+                        // A closed app-server cannot serve the current refresh.
+                        // Reconnect once within the same coordinated flight.
+                        if matches!(
+                            &result,
+                            Err(AdapterError::Io { .. }
+                                | AdapterError::Protocol { .. }
+                                | AdapterError::MalformedJson
+                                | AdapterError::UnexpectedChildExit
+                                | AdapterError::StderrFlooding { .. }
+                                | AdapterError::AlreadyShutdown)
+                        ) {
+                            diagnostic(format!(
+                                "quota client disconnected generation={} error={}",
+                                session.generation,
+                                adapter_error_kind(result.as_ref().unwrap_err())
+                            ));
+                            session.client.take();
+                            if attempt == 0 {
+                                continue;
+                            }
+                        }
+                        diagnostic(format!(
+                            "quota read generation={} ok={}",
+                            session.generation,
+                            result.is_ok()
+                        ));
+                        return result;
                     }
-                    let result = client
-                        .as_ref()
-                        .expect("connected client")
-                        .read_rate_limits();
-                    // RPC errors and request deadlines leave the adapter usable.
-                    // Transport/protocol failures are latched by the adapter and
-                    // require a new client on the next coordinated refresh.
-                    if matches!(
-                        &result,
-                        Err(AdapterError::Io { .. }
-                            | AdapterError::Protocol { .. }
-                            | AdapterError::MalformedJson
-                            | AdapterError::UnexpectedChildExit
-                            | AdapterError::StderrFlooding { .. }
-                            | AdapterError::AlreadyShutdown)
-                    ) {
-                        client.take();
-                    }
-                    result
+                    unreachable!("two reconnect attempts are bounded")
                 },
                 move |event, snapshot| {
                     if let Some(emit) = active_emitter
@@ -510,13 +873,90 @@ impl AppState {
                 session.stopped = true;
                 session.client.take();
             }),
+            reset: Box::new(move || {
+                let mut session = reset_session.lock().expect("client mutex poisoned");
+                if !session.stopped {
+                    diagnostic(format!(
+                        "quota client reset generation={}",
+                        session.generation
+                    ));
+                    session.client.take();
+                }
+            }),
         }
     }
 }
 
 #[tauri::command]
-fn read_quota(state: tauri::State<'_, AppState>) -> QuotaSnapshot {
-    state.coordinator.refresh()
+fn read_quota(state: tauri::State<'_, AppState>, source: Option<String>) -> QuotaSnapshot {
+    let source = match source.as_deref() {
+        Some("manual") => "manual",
+        _ => "automatic",
+    };
+    diagnostic(format!("quota command source={source} started"));
+    let snapshot = state.coordinator.refresh();
+    diagnostic(format!(
+        "quota command source={source} completed stale={}",
+        snapshot.stale
+    ));
+    snapshot
+}
+
+#[tauri::command]
+fn read_account_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    account: tauri::State<'_, AccountState>,
+    quota: tauri::State<'_, AppState>,
+) -> AccountStatus {
+    let (status, became_logged_in) = account.status();
+    if became_logged_in {
+        (quota.reset)();
+    }
+    let _ = app.emit(ACCOUNT_UPDATED_EVENT, status);
+    status
+}
+
+#[tauri::command]
+fn start_chatgpt_login<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    account: tauri::State<'_, AccountState>,
+) -> Result<AccountStatus, String> {
+    let (status, notifications) = account.start(&app)?;
+    let account = (*account).clone();
+    let notification_app = app.clone();
+    if let Some(notifications) = notifications {
+        thread::spawn(move || {
+            while let Ok(notification) = notifications.recv() {
+                let Some(notification) = LoginNotification::from_server_event(
+                    &notification.method,
+                    &notification.params,
+                ) else {
+                    continue;
+                };
+                let Some((status, became_logged_in)) =
+                    account.handle_login_notification(notification)
+                else {
+                    continue;
+                };
+                if became_logged_in {
+                    (notification_app.state::<AppState>().reset)();
+                }
+                let _ = notification_app.emit(ACCOUNT_UPDATED_EVENT, status);
+            }
+        });
+    }
+    let _ = app.emit(ACCOUNT_UPDATED_EVENT, status);
+    Ok(status)
+}
+
+#[tauri::command]
+fn cancel_chatgpt_login<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    account: tauri::State<'_, AccountState>,
+) -> Result<AccountStatus, String> {
+    let status = account.cancel()?;
+    let _ = app.emit(ACCOUNT_UPDATED_EVENT, status);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -553,7 +993,7 @@ fn handle_run_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![read_quota, read_window_locked])
+        .invoke_handler(tauri::generate_handler![read_quota, read_window_locked, read_account_status, start_chatgpt_login, cancel_chatgpt_login])
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_autostart::Builder::new()
@@ -616,12 +1056,55 @@ pub fn run() {
                 initial_rect.y as i32,
             ));
             let handle = app.handle().clone();
+            let bundled_runtime = runtime::bundled_executable_for(&std::env::current_exe()?);
+            let private_runtime_home = runtime::private_codex_home(&app.path().app_data_dir()?);
+            diagnostic(format!("startup bundled_exe={} CODEX_HOME={}", bundled_runtime.display(), private_runtime_home.display()));
+            let account_bundled_runtime = bundled_runtime.clone();
+            let account_private_runtime_home = private_runtime_home.clone();
             app.manage(AppState::new(
-                || CodexClient::connect(Default::default()),
+                move || match CodexClient::connect(Default::default()) {
+                    Ok(client) if client.has_chatgpt_login().unwrap_or(false) => {
+                        diagnostic("quota selected runtime=system");
+                        Ok(client)
+                    },
+                    Ok(client) => {
+                        drop(client);
+                        diagnostic(format!("quota selected runtime=bundled exe={} CODEX_HOME={}", bundled_runtime.display(), private_runtime_home.display()));
+                        CodexClient::connect_with_runtime(
+                            Default::default(),
+                            bundled_runtime.clone(),
+                            Some(private_runtime_home.clone()),
+                        )
+                    }
+                    Err(error) => {
+                        diagnostic(format!("quota system runtime unavailable error={}; selecting bundled exe={} CODEX_HOME={}", adapter_error_kind(&error), bundled_runtime.display(), private_runtime_home.display()));
+                        CodexClient::connect_with_runtime(
+                        Default::default(),
+                        bundled_runtime.clone(),
+                        Some(private_runtime_home.clone()),
+                    )},
+                },
                 move |event, snapshot| {
                     let _ = handle.emit(event, snapshot);
                 },
             ));
+            app.manage(AccountState::new(move || {
+                match CodexClient::connect(Default::default()) {
+                    Ok(client) if client.has_chatgpt_login().unwrap_or(false) => {
+                        diagnostic("account selected runtime=system");
+                        Ok(client)
+                    },
+                    Ok(client) => {
+                        drop(client);
+                        diagnostic(format!("account selected runtime=bundled exe={} CODEX_HOME={}", account_bundled_runtime.display(), account_private_runtime_home.display()));
+                        CodexClient::connect_with_runtime(Default::default(), account_bundled_runtime.clone(), Some(account_private_runtime_home.clone()))
+                    }
+                    Err(error) => {
+                        diagnostic(format!("account system runtime unavailable error={}; selecting bundled exe={} CODEX_HOME={}", adapter_error_kind(&error), account_bundled_runtime.display(), account_private_runtime_home.display()));
+                        CodexClient::connect_with_runtime(Default::default(), account_bundled_runtime.clone(), Some(account_private_runtime_home.clone()))
+                    },
+                }
+            }));
             let tray_result = (|| {
                 let show = MenuItem::with_id(app, "show", "显示 Codex Pet", true, None::<&str>)?;
                 let hide = MenuItem::with_id(app, "hide", "隐藏", true, None::<&str>)?;
@@ -842,6 +1325,94 @@ mod wiring_tests {
 
     const TIMEOUT: Duration = Duration::from_secs(3);
 
+    struct FakeAccountReader(Mutex<VecDeque<Result<bool, AdapterError>>>);
+
+    impl AccountReader for FakeAccountReader {
+        fn has_chatgpt_login(&self) -> Result<bool, AdapterError> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected account/read")
+        }
+    }
+
+    #[test]
+    fn account_read_reconnects_after_a_stale_client_without_reporting_logged_out() {
+        let old = FakeAccountReader(Mutex::new(VecDeque::from([Err(
+            AdapterError::UnexpectedChildExit,
+        )])));
+        let fresh = FakeAccountReader(Mutex::new(VecDeque::from([Ok(true)])));
+        let pool = Mutex::new(VecDeque::from([Ok(fresh)]));
+        let mut client = Some(old);
+        let logged_in = read_account_login_with_reconnect(&mut client, &|| {
+            pool.lock().unwrap().pop_front().unwrap()
+        });
+        assert!(logged_in.unwrap());
+    }
+
+    #[test]
+    fn account_connect_retries_a_transient_failure_and_preserves_login() {
+        let fresh = FakeAccountReader(Mutex::new(VecDeque::from([Ok(true)])));
+        let pool = Mutex::new(VecDeque::from([
+            Err(AdapterError::UnexpectedChildExit),
+            Ok(fresh),
+        ]));
+        let mut client = None;
+        let logged_in = read_account_login_with_reconnect(&mut client, &|| {
+            pool.lock().unwrap().pop_front().unwrap()
+        });
+        assert!(logged_in.unwrap());
+    }
+
+    #[test]
+    fn account_read_failure_is_an_error_not_a_logged_out_result() {
+        let pool = Mutex::new(VecDeque::<Result<FakeAccountReader, AdapterError>>::from([
+            Err(AdapterError::UnexpectedChildExit),
+            Err(AdapterError::UnexpectedChildExit),
+        ]));
+        let mut client = None;
+        let result = read_account_login_with_reconnect(&mut client, &|| {
+            pool.lock().unwrap().pop_front().unwrap()
+        });
+        assert!(matches!(result, Err(AdapterError::UnexpectedChildExit)));
+    }
+
+    #[test]
+    fn account_runtime_unavailable_is_not_reported_as_a_login_failure() {
+        let state = AccountState::new(|| Err(AdapterError::ExecutableNotFound));
+
+        let (status, became_logged_in) = state.status();
+
+        assert_eq!(status, AccountStatus::Unavailable);
+        assert!(!became_logged_in);
+    }
+
+    #[test]
+    fn account_updated_read_error_ends_login_wait_as_unavailable() {
+        let mut machine = AccountMachine::new();
+        machine.begin("login-1".into());
+
+        let outcome =
+            account_updated_read_result(&mut machine, Err(AdapterError::UnexpectedChildExit));
+
+        assert_eq!(outcome, Some((AccountStatus::Unavailable, false)));
+        assert_eq!(machine.status(), AccountStatus::Unavailable);
+    }
+
+    #[test]
+    fn login_completion_read_error_is_not_reported_as_failed_authentication() {
+        let mut machine = AccountMachine::new();
+        machine.begin("login-1".into());
+        assert!(machine.complete("login-1", true));
+
+        let outcome =
+            login_completed_read_result(&mut machine, Err(AdapterError::UnexpectedChildExit));
+
+        assert_eq!(outcome, (AccountStatus::Unavailable, false));
+        assert_eq!(machine.status(), AccountStatus::Unavailable);
+    }
+
     struct FakeClient {
         results: Mutex<VecDeque<Result<Value, AdapterError>>>,
         notifications: Mutex<Option<mpsc::Receiver<ServerNotification>>>,
@@ -965,12 +1536,31 @@ mod wiring_tests {
     }
 
     #[test]
+    fn login_success_resets_the_old_quota_client_and_restores_notifications() {
+        let (old, old_probe) = client(vec![Ok(response(25.0))]);
+        let (fresh, fresh_probe) = client(vec![Ok(response(40.0)), Ok(response(45.0))]);
+        let (state, attempts, emitted) = state(vec![Ok(old), Ok(fresh)]);
+        assert_eq!(state.coordinator.refresh().windows[0].used_percent, 25.0);
+        emitted.recv_timeout(TIMEOUT).unwrap();
+
+        (state.reset)();
+        assert_eq!(old_probe.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(state.coordinator.refresh().windows[0].used_percent, 40.0);
+        emitted.recv_timeout(TIMEOUT).unwrap();
+        notify(&fresh_probe);
+        let (_, updated) = emitted.recv_timeout(TIMEOUT).unwrap();
+        assert_eq!(updated["windows"][0]["usedPercent"], 45.0);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(fresh_probe.takes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn notification_failure_uses_the_command_coordinators_last_success() {
         let (client, probe) = client(vec![
             Ok(response(25.0)),
             Err(AdapterError::UnexpectedChildExit),
         ]);
-        let (state, _, emitted) = state(vec![Ok(client)]);
+        let (state, _, emitted) = state(vec![Ok(client), Err(AdapterError::ExecutableNotFound)]);
         let initial = serde_json::to_value(state.coordinator.refresh()).unwrap();
         emitted.recv_timeout(TIMEOUT).unwrap();
         notify(&probe);
@@ -982,13 +1572,9 @@ mod wiring_tests {
     }
 
     #[test]
-    fn connection_failure_is_unavailable_and_the_next_refresh_retries() {
+    fn connection_failure_retries_once_within_the_same_quota_refresh() {
         let (client, probe) = client(vec![Ok(response(25.0))]);
         let (state, attempts, _) = state(vec![Err(AdapterError::ExecutableNotFound), Ok(client)]);
-        let unavailable = state.coordinator.refresh();
-        assert_eq!(unavailable.availability, "unavailable");
-        assert!(unavailable.windows.is_empty());
-        assert!(!unavailable.stale);
         let recovered = state.coordinator.refresh();
         assert_eq!(recovered.windows[0].used_percent, 25.0);
         assert!(!recovered.stale);
@@ -1016,14 +1602,11 @@ mod wiring_tests {
             let (second, second_probe) = client(vec![Ok(response(40.0))]);
             let (state, attempts, _) = state(vec![Ok(first), Ok(second)]);
             let initial = state.coordinator.refresh();
-            let stale = state.coordinator.refresh();
-            assert!(stale.stale, "{error:?}");
-            assert_eq!(stale.fetched_at, initial.fetched_at);
-            assert_eq!(stale.windows[0].used_percent, 25.0);
-            assert_eq!(first_probe.drops.load(Ordering::SeqCst), 1, "{error:?}");
             let recovered = state.coordinator.refresh();
+            assert!(!recovered.stale, "{error:?}");
             assert_eq!(recovered.windows[0].used_percent, 40.0);
-            assert!(!recovered.stale);
+            assert_eq!(first_probe.drops.load(Ordering::SeqCst), 1, "{error:?}");
+            assert!(initial.windows[0].used_percent == 25.0);
             assert!(recovered.message.is_none());
             assert_eq!(attempts.load(Ordering::SeqCst), 2);
             assert_eq!(first_probe.takes.load(Ordering::SeqCst), 1);
@@ -1036,8 +1619,6 @@ mod wiring_tests {
         let (first, _) = client(vec![Err(AdapterError::UnexpectedChildExit)]);
         let (second, probe) = client(vec![Ok(response(40.0)), Ok(response(45.0))]);
         let (state, attempts, emitted) = state(vec![Ok(first), Ok(second)]);
-        assert_eq!(state.coordinator.refresh().availability, "unavailable");
-        emitted.recv_timeout(TIMEOUT).unwrap();
         assert_eq!(state.coordinator.refresh().windows[0].used_percent, 40.0);
         emitted.recv_timeout(TIMEOUT).unwrap();
         notify(&probe);

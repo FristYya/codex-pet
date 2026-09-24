@@ -27,6 +27,12 @@ coverage
 .cache
 .superpowers
 .worktrees/
+.runtime-cache/
+src-tauri/resources/codex-runtime/
+!src-tauri/resources/
+!src-tauri/resources/codex-runtime/
+src-tauri/resources/codex-runtime/*
+!src-tauri/resources/codex-runtime/.gitkeep
 
 # Editor directories and files
 .vscode/*
