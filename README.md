@@ -14,7 +14,7 @@ Codex Pet is an independent open-source project and is not an official OpenAI pr
 
 ## 系统要求
 
-- Windows 10 或 Windows 11。
+- Windows 10 或 Windows 11（x64）。
 - 无需预装 Codex CLI，也不需要打开终端。
 
 Codex Pet 不提供密码、Cookie 或 Token 输入框，也不会自行解析或展示认证文件。随包的官方 Codex Runtime 会在 Codex Pet 专用的用户数据目录中管理自己的登录数据，并通过本机 App Server 使用该登录状态。若发现已有可用 Codex 登录会直接复用；否则桌宠会引导你通过系统浏览器登录 ChatGPT。
@@ -49,7 +49,7 @@ Codex Pet 的界面与 Rust 适配层不会直接读取、记录或展示密码�
 
 ## 当前限制
 
-- 目前仅支持 Windows 10/11；尚未提供完整的 macOS 适配。
+- v0.1.0 正式支持 Windows 10/11 x64；macOS 尚未作为正式发布目标支持。
 - 额度显示依赖可用的本地 Codex App Server；安装包会随附已验证版本的 runtime，系统已有的兼容登录可直接复用。
 - 多显示器和 DPI 恢复已具备保护逻辑，但完整的真实硬件组合仍会随 Windows、显示器和缩放设置而不同。
 - 不提供额度历史、自动更新、独立设置主窗口、额外皮肤或 Claude/Gemini 支持。
